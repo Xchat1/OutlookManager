@@ -1,4 +1,0 @@
-# 批量邮箱账户配置文件
-# 格式：用户名----密码----client_id----refresh_token
-# 每行一个账户，用----分隔各字段
-# 示例：user@example.com----password123----your_client_id----refresh_token_here

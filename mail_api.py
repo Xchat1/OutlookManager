@@ -32,6 +32,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, EmailStr, ValidationError
 
+# 导入数据库管理器
+from database import db_manager
+
 # 移除代理相关代码，以兼容Docker环境
 
 # ============================================================================
@@ -115,6 +118,22 @@ class TempMessageDetailRequest(BaseModel):
     refresh_token: str
     message_id: str
 
+class SystemConfigRequest(BaseModel):
+    """系统配置请求"""
+    email_limit: int = 5
+
+class AccountTagRequest(BaseModel):
+    """账户标签请求"""
+    email: EmailStr
+    tags: List[str] = []
+
+class TestEmailRequest(BaseModel):
+    """测试邮件请求模型"""
+    email: EmailStr
+    password: str = ""
+    client_id: str = ""
+    refresh_token: str = ""
+
 # ============================================================================
 # 配置常量
 # ============================================================================
@@ -133,6 +152,9 @@ logger = logging.getLogger(__name__)
 
 # 管理认证配置
 ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'admin123')  # 从环境变量获取，默认为admin123
+
+# 系统配置
+DEFAULT_EMAIL_LIMIT = 5  # 默认邮件获取数量限制
 
 # ============================================================================
 # 辅助函数
@@ -182,45 +204,26 @@ def get_admin_token(authorization: Optional[str] = Header(None)) -> str:
     return token
 
 async def load_accounts_config() -> Dict[str, Dict[str, str]]:
-    """从配置文件加载批量账户信息（异步版本）"""
-    def _sync_load():
-        accounts = {}
-        try:
-            with open('config.txt', 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                
-            for line in lines:
-                line = line.strip()
-                # 跳过注释和空行
-                if line.startswith('#') or not line:
-                    continue
-                    
-                # 解析格式：用户名----密码----client_id----refresh_token
-                # 但现在我们只需要用户名和refresh_token，使用固定的CLIENT_ID
-                parts = line.split('----')
-                if len(parts) >= 4:  # 至少需要4个部分
-                    email, password, client_id, refresh_token = parts[0], parts[1], parts[2], parts[3]
-                    accounts[email.strip()] = {
-                        'password': password.strip(),
-                        'refresh_token': refresh_token.strip()
-                        # 不再存储client_id，使用全局的CLIENT_ID
-                    }
-                elif len(parts) == 2:  # 兼容旧格式：邮箱----refresh_token
-                    email, refresh_token = parts
-                    accounts[email.strip()] = {
-                        'password': '',  # 旧格式没有密码
-                        'refresh_token': refresh_token.strip()
-                    }
-                    
-        except FileNotFoundError:
-            logger.warning("配置文件不存在")
-        except Exception as e:
-            logger.error(f"加载配置文件失败: {e}")
-            
+    """从数据库加载批量账户信息（异步版本）"""
+    try:
+        # 首先尝试从数据库加载
+        accounts = await db_manager.get_all_accounts()
+        
+        # 如果数据库为空，尝试从config.txt迁移
+        if not accounts:
+            logger.info("数据库中没有账户，尝试从config.txt迁移...")
+            added_count, error_count = await db_manager.migrate_from_config_file()
+            if added_count > 0:
+                logger.info(f"成功从config.txt迁移了 {added_count} 个账户")
+                accounts = await db_manager.get_all_accounts()
+            else:
+                logger.info("没有找到config.txt或迁移失败")
+        
         return accounts
-    
-    # 在线程池中执行同步操作
-    return await asyncio.to_thread(_sync_load)
+        
+    except Exception as e:
+        logger.error(f"加载账户配置失败: {e}")
+        return {}
 
 async def save_accounts_config(accounts: Dict[str, Dict[str, str]]) -> bool:
     """保存账户信息到配置文件（异步版本）"""
@@ -266,6 +269,50 @@ async def save_accounts_config(accounts: Dict[str, Dict[str, str]]) -> bool:
             return False
     
     return await asyncio.to_thread(_sync_save)
+
+# ============================================================================
+# 系统配置管理
+# ============================================================================
+
+async def load_system_config() -> Dict[str, any]:
+    """加载系统配置（使用数据库）"""
+    try:
+        email_limit = await db_manager.get_system_config('email_limit', str(DEFAULT_EMAIL_LIMIT))
+        return {
+            'email_limit': int(email_limit) if email_limit else DEFAULT_EMAIL_LIMIT
+        }
+    except Exception as e:
+        logger.error(f"加载系统配置失败: {e}")
+        return {'email_limit': DEFAULT_EMAIL_LIMIT}
+
+async def save_system_config(config: Dict[str, any]) -> bool:
+    """保存系统配置（使用数据库）"""
+    try:
+        for key, value in config.items():
+            await db_manager.set_system_config(key, str(value))
+        return True
+    except Exception as e:
+        logger.error(f"保存系统配置失败: {e}")
+        return False
+
+async def get_system_config_value(key: str, default_value: any = None) -> any:
+    """获取系统配置值（使用数据库）"""
+    try:
+        value = await db_manager.get_system_config(key, str(default_value) if default_value is not None else None)
+        if key == 'email_limit' and value:
+            return int(value)
+        return value
+    except Exception as e:
+        logger.error(f"获取系统配置失败: {e}")
+        return default_value
+
+async def set_system_config_value(key: str, value: any) -> bool:
+    """设置系统配置值（使用数据库）"""
+    try:
+        return await db_manager.set_system_config(key, str(value))
+    except Exception as e:
+        logger.error(f"设置系统配置失败: {e}")
+        return False
 
 async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]], 
                              new_accounts: List[ImportAccountData], 
@@ -868,12 +915,16 @@ async def lifespan(app: FastAPI):
     """应用程序生命周期管理"""
     # 启动时的初始化
     logger.info("启动邮件管理系统...")
+    logger.info("初始化数据库...")
+    # 数据库已在导入时初始化
     yield
     # 关闭时的清理
     logger.info("正在关闭邮件管理系统...")
     try:
         # 使用新的清理方法
         await email_manager.cleanup_all()
+        # 关闭数据库连接
+        db_manager.close()
     except Exception as e:
         logger.error(f"清理系统资源时出错: {e}")
     logger.info("邮件管理系统已关闭")
@@ -963,12 +1014,16 @@ async def admin_js():
     return FileResponse("static/admin.js")
 
 @app.get("/api/messages")
-async def get_messages(email: str, top: int = 5) -> ApiResponse:
+async def get_messages(email: str, top: int = None) -> ApiResponse:
     """获取邮件列表"""
     email = email.strip()
     
     if not email:
         return ApiResponse(success=False, message="请提供邮箱地址")
+    
+    # 如果没有指定top参数，使用系统配置的默认值
+    if top is None:
+        top = await get_system_config_value('email_limit', DEFAULT_EMAIL_LIMIT)
     
     try:
         messages = await email_manager.get_messages(email, top)
@@ -1267,8 +1322,8 @@ async def export_accounts_public(format: str = "txt"):
         for email, account_info in accounts.items():
             password = account_info.get('password', '')
             refresh_token = account_info.get('refresh_token', '')
-            # 使用全局CLIENT_ID
-            line = f"{email}----{password}----{CLIENT_ID}----{refresh_token}"
+            client_id = account_info.get('client_id', CLIENT_ID)
+            line = f"{email}----{password}----{client_id}----{refresh_token}"
             export_lines.append(line)
         
         export_content = "\n".join(export_lines)
@@ -1310,8 +1365,8 @@ async def export_accounts(token: str = Depends(get_admin_token)):
         for email, account_info in accounts.items():
             password = account_info.get('password', '')
             refresh_token = account_info.get('refresh_token', '')
-            # 使用全局CLIENT_ID
-            line = f"{email}----{password}----{CLIENT_ID}----{refresh_token}"
+            client_id = account_info.get('client_id', CLIENT_ID)
+            line = f"{email}----{password}----{client_id}----{refresh_token}"
             export_lines.append(line)
         
         export_content = "\n".join(export_lines)
@@ -1487,6 +1542,155 @@ async def delete_account(email: str) -> ApiResponse:
     except Exception as e:
         logger.error(f"删除账户失败: {e}")
         return ApiResponse(success=False, message=f"删除账户失败: {str(e)}")
+
+# ============================================================================
+# 系统配置API端点
+# ============================================================================
+
+@app.get("/api/system/config")
+async def get_system_config() -> ApiResponse:
+    """获取系统配置"""
+    try:
+        config = await load_system_config()
+        return ApiResponse(success=True, data=config)
+    except Exception as e:
+        logger.error(f"获取系统配置失败: {e}")
+        return ApiResponse(success=False, message="获取系统配置失败")
+
+@app.post("/api/system/config")
+async def update_system_config(request: SystemConfigRequest) -> ApiResponse:
+    """更新系统配置"""
+    try:
+        # 验证邮件限制范围
+        if request.email_limit < 1 or request.email_limit > 50:
+            return ApiResponse(success=False, message="邮件限制必须在1-50之间")
+        
+        success = await set_system_config_value('email_limit', request.email_limit)
+        if success:
+            return ApiResponse(success=True, message=f"系统配置更新成功，邮件限制设置为 {request.email_limit}")
+        else:
+            return ApiResponse(success=False, message="保存系统配置失败")
+    except Exception as e:
+        logger.error(f"更新系统配置失败: {e}")
+        return ApiResponse(success=False, message="更新系统配置失败")
+
+# ============================================================================
+# 账户标签管理API端点
+# ============================================================================
+
+@app.get("/api/account/{email}/tags")
+async def get_account_tags(email: str, token: str = Depends(get_admin_token)) -> ApiResponse:
+    """获取账户标签（使用数据库）"""
+    try:
+        # 检查账户是否存在
+        accounts = await load_accounts_config()
+        if email not in accounts:
+            return ApiResponse(success=False, message=f"账户 {email} 不存在")
+        
+        tags = await db_manager.get_account_tags(email)
+        return ApiResponse(success=True, data={"email": email, "tags": tags})
+    except Exception as e:
+        logger.error(f"获取账户标签失败: {e}")
+        return ApiResponse(success=False, message="获取账户标签失败")
+
+@app.post("/api/account/{email}/tags")
+async def update_account_tags(email: str, request: AccountTagRequest, token: str = Depends(get_admin_token)) -> ApiResponse:
+    """更新账户标签（使用数据库）"""
+    try:
+        # 检查账户是否存在
+        accounts = await load_accounts_config()
+        if email not in accounts:
+            return ApiResponse(success=False, message=f"账户 {email} 不存在")
+        
+        # 更新标签到数据库
+        success = await db_manager.set_account_tags(email, request.tags)
+        if success:
+            return ApiResponse(success=True, message=f"成功更新账户 {email} 的标签")
+        else:
+            return ApiResponse(success=False, message="保存账户标签失败")
+    except Exception as e:
+        logger.error(f"更新账户标签失败: {e}")
+        return ApiResponse(success=False, message="更新账户标签失败")
+
+@app.get("/api/accounts/tags")
+async def get_all_tags(token: str = Depends(get_admin_token)) -> ApiResponse:
+    """获取所有标签和账户标签映射（使用数据库）"""
+    try:
+        # 获取所有标签
+        all_tags = await db_manager.get_all_tags()
+        
+        # 获取账户标签映射
+        accounts_with_tags = await db_manager.get_accounts_with_tags()
+        
+        return ApiResponse(success=True, data={
+            "tags": all_tags,
+            "accounts": accounts_with_tags
+        })
+    except Exception as e:
+        logger.error(f"获取所有标签失败: {e}")
+        return ApiResponse(success=False, message="获取所有标签失败")
+
+# ============================================================================
+# 测试邮件API端点
+# ============================================================================
+
+@app.post("/api/test-email")
+async def test_email_connection(request: dict) -> ApiResponse:
+    """测试邮件连接，只获取最新的1条邮件"""
+    try:
+        email = request.get('email', '').strip()
+        if not email:
+            return ApiResponse(success=False, message="请提供邮箱地址")
+        
+        # 检查是否为临时账户测试
+        if 'refresh_token' in request:
+            # 临时账户测试
+            account_info = {
+                'password': request.get('password', ''),
+                'refresh_token': request.get('refresh_token', '')
+            }
+            
+            temp_client = EmailClient(email, account_info)
+            try:
+                # 只获取最新的1条邮件
+                messages = await temp_client.get_messages(top=1)
+                if messages:
+                    latest_message = messages[0]
+                    return ApiResponse(
+                        success=True, 
+                        data=latest_message,
+                        message="测试成功，获取到最新邮件"
+                    )
+                else:
+                    return ApiResponse(
+                        success=True, 
+                        data=None,
+                        message="测试成功，但该邮箱暂无邮件"
+                    )
+            finally:
+                await temp_client.cleanup()
+        else:
+            # 配置文件中的账户测试
+            messages = await email_manager.get_messages(email, 1)
+            if messages:
+                latest_message = messages[0]
+                return ApiResponse(
+                    success=True, 
+                    data=latest_message,
+                    message="测试成功，获取到最新邮件"
+                )
+            else:
+                return ApiResponse(
+                    success=True, 
+                    data=None,
+                    message="测试成功，但该邮箱暂无邮件"
+                )
+                
+    except HTTPException as e:
+        return ApiResponse(success=False, message=e.detail)
+    except Exception as e:
+        logger.error(f"测试邮件连接失败: {e}")
+        return ApiResponse(success=False, message=f"测试失败: {str(e)}")
 
 @app.get("/api/export")
 async def export_accounts(format: str = "txt") -> ApiResponse:
