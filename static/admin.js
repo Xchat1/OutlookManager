@@ -4,6 +4,11 @@ class AdminManager {
     constructor() {
         this.isAuthenticated = false;
         this.token = '';
+        // 分页与搜索状态
+        this.page = 1;
+        this.pageSize = 10;
+        this.total = 0;
+        this.query = '';
         this.init();
     }
 
@@ -17,11 +22,61 @@ class AdminManager {
         document.getElementById('loginForm').addEventListener('submit', this.handleLogin.bind(this));
         
         // 刷新账号列表
-        document.getElementById('refreshAccountsBtn').addEventListener('click', this.loadAccounts.bind(this));
+        document.getElementById('refreshAccountsBtn').addEventListener('click', () => {
+            this.page = 1;
+            this.loadAccounts();
+        });
+
+        // 搜索
+        const searchInput = document.getElementById('accountSearchInput');
+        const searchBtn = document.getElementById('searchAccountsBtn');
+        if (searchBtn) {
+            searchBtn.addEventListener('click', () => {
+                this.query = searchInput.value.trim();
+                this.page = 1;
+                this.loadAccounts();
+            });
+        }
+        if (searchInput) {
+            searchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') {
+                    this.query = searchInput.value.trim();
+                    this.page = 1;
+                    this.loadAccounts();
+                }
+            });
+        }
+
+        // 分页
+        const prevBtn = document.getElementById('prevPageBtn');
+        const nextBtn = document.getElementById('nextPageBtn');
+        if (prevBtn) {
+            prevBtn.addEventListener('click', () => {
+                if (this.page > 1) {
+                    this.page -= 1;
+                    this.loadAccounts();
+                }
+            });
+        }
+        if (nextBtn) {
+            nextBtn.addEventListener('click', () => {
+                const maxPage = Math.max(1, Math.ceil(this.total / this.pageSize));
+                if (this.page < maxPage) {
+                    this.page += 1;
+                    this.loadAccounts();
+                }
+            });
+        }
         
-        // 导入相关
-        document.getElementById('executeImportBtn').addEventListener('click', this.executeImport.bind(this));
-        document.getElementById('clearImportBtn').addEventListener('click', this.clearImport.bind(this));
+        // 导入相关（存在才绑定）
+        const executeImportBtn = document.getElementById('executeImportBtn');
+        if (executeImportBtn) {
+            executeImportBtn.addEventListener('click', this.executeImport.bind(this));
+        }
+        const clearImportBtn = document.getElementById('clearImportBtn');
+        if (clearImportBtn) {
+            clearImportBtn.addEventListener('click', this.clearImport.bind(this));
+        }
         
         // 导出
         document.getElementById('exportDataBtn').addEventListener('click', this.exportData.bind(this));
@@ -29,67 +84,17 @@ class AdminManager {
         // 退出登录
         document.getElementById('logoutBtn').addEventListener('click', this.logout.bind(this));
         
-        // 选项卡切换时刷新数据
-        document.getElementById('accounts-tab').addEventListener('click', () => {
-            setTimeout(() => this.loadAccounts(), 100);
-        });
-        
-        // 标签管理相关事件
-        const refreshTagsBtn = document.getElementById('refreshTagsBtn');
-        if (refreshTagsBtn) {
-            refreshTagsBtn.addEventListener('click', this.loadAllTags.bind(this));
+        // 单页：不使用tabs，直接加载列表
+        setTimeout(() => this.loadAccounts(), 100);
+
+        // 打开导入对话框
+        const openImportBtn = document.getElementById('openImportModalBtn');
+        if (openImportBtn) {
+            openImportBtn.addEventListener('click', () => {
+                const modal = new bootstrap.Modal(document.getElementById('importModal'));
+                modal.show();
+            });
         }
-        
-        const tagAccountSelect = document.getElementById('tagAccountSelect');
-        if (tagAccountSelect) {
-            tagAccountSelect.addEventListener('change', this.loadAccountTags.bind(this));
-        }
-        
-        const saveTagsBtn = document.getElementById('saveTagsBtn');
-        if (saveTagsBtn) {
-            saveTagsBtn.addEventListener('click', this.saveAccountTags.bind(this));
-        }
-        
-        const clearTagsBtn = document.getElementById('clearTagsBtn');
-        if (clearTagsBtn) {
-            clearTagsBtn.addEventListener('click', this.clearAccountTags.bind(this));
-        }
-        
-        // 系统配置相关事件
-        const saveConfigBtn = document.getElementById('saveConfigBtn');
-        if (saveConfigBtn) {
-            saveConfigBtn.addEventListener('click', this.saveSystemConfig.bind(this));
-        }
-        
-        const resetConfigBtn = document.getElementById('resetConfigBtn');
-        if (resetConfigBtn) {
-            resetConfigBtn.addEventListener('click', this.resetSystemConfig.bind(this));
-        }
-        
-        const testEmailBtn = document.getElementById('testEmailBtn');
-        if (testEmailBtn) {
-            testEmailBtn.addEventListener('click', this.showTestEmailModal.bind(this));
-        }
-        
-        // 测试邮件相关事件
-        const testEmailForm = document.getElementById('testEmailForm');
-        if (testEmailForm) {
-            testEmailForm.addEventListener('submit', this.executeEmailTest.bind(this));
-        }
-        
-        // 选项卡切换时加载相应数据
-        document.getElementById('tags-tab').addEventListener('click', () => {
-            setTimeout(() => {
-                this.loadAllTags();
-                this.loadAccountsForTags();
-            }, 100);
-        });
-        
-        document.getElementById('config-tab').addEventListener('click', () => {
-            setTimeout(() => {
-                this.loadSystemConfig();
-            }, 100);
-        });
     }
 
     checkStoredAuth() {
@@ -166,20 +171,26 @@ class AdminManager {
 
     async loadAccounts() {
         const accountsList = document.getElementById('accountsList');
-        const accountCount = document.getElementById('accountCount');
         
-        // 显示加载状态
-        accountsList.innerHTML = `
-            <div class="text-center py-4">
-                <div class="spinner-border text-primary" role="status">
-                    <span class="visually-hidden">加载中...</span>
-                </div>
-                <div class="mt-2">正在加载账号列表...</div>
-            </div>
-        `;
+        // 显示加载状态（表格内）
+        const tbodyLoading = document.getElementById('accountsTbody');
+        if (tbodyLoading) {
+            tbodyLoading.innerHTML = `
+                <tr>
+                    <td colspan="3" class="text-center py-4">
+                        <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
+                        <div class="mt-2 small text-muted">正在加载账号列表...</div>
+                    </td>
+                </tr>
+            `;
+        }
 
         try {
-            const response = await fetch('/api/accounts', {
+            const params = new URLSearchParams();
+            params.set('page', String(this.page));
+            params.set('page_size', String(this.pageSize));
+            if (this.query) params.set('q', this.query);
+            const response = await fetch(`/api/accounts/paged?${params.toString()}`, {
                 headers: {
                     'Authorization': `Bearer ${this.token}`
                 }
@@ -188,8 +199,12 @@ class AdminManager {
             if (response.ok) {
                 const result = await response.json();
                 if (result.success) {
-                    this.renderAccounts(result.data);
-                    accountCount.textContent = result.data.length;
+                    const items = (result.data && result.data.items) ? result.data.items : [];
+                    this.total = (result.data && typeof result.data.total === 'number') ? result.data.total : items.length;
+                    this.page = (result.data && typeof result.data.page === 'number') ? result.data.page : this.page;
+                    this.pageSize = (result.data && typeof result.data.page_size === 'number') ? result.data.page_size : this.pageSize;
+                    this.renderAccounts(items);
+                    this.renderPager();
                 } else {
                     throw new Error(result.message);
                 }
@@ -207,22 +222,21 @@ class AdminManager {
                     </button>
                 </div>
             `;
-            accountCount.textContent = '0';
         }
     }
 
     async renderAccounts(accounts) {
-        const accountsList = document.getElementById('accountsList');
+        const tbody = document.getElementById('accountsTbody');
+        if (!tbody) return;
         
         if (accounts.length === 0) {
-            accountsList.innerHTML = `
-                <div class="text-center py-4">
-                    <i class="bi bi-inbox display-4 text-muted"></i>
-                    <div class="mt-3 text-muted">
-                        <h6>暂无账号数据</h6>
-                        <p class="small mb-0">请通过"数据导入"功能添加邮箱账号</p>
-                    </div>
-                </div>
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="3" class="text-center py-4 text-muted">
+                        <i class="bi bi-inbox"></i>
+                        <div class="mt-2 small">暂无账号数据</div>
+                    </td>
+                </tr>
             `;
             return;
         }
@@ -237,182 +251,27 @@ class AdminManager {
                 '<span class="text-muted small">无标签</span>';
             
             return `
-                <div class="account-item">
-                    <div class="d-flex justify-content-between align-items-start">
-                        <div class="flex-grow-1">
-                            <h6 class="mb-1">
-                                <i class="bi bi-envelope me-2"></i>${account.email}
-                            </h6>
-                            <div class="small text-muted mb-2">
-                                <span class="me-3">
-                                    <i class="bi bi-calendar3 me-1"></i>
-                                    添加时间: ${new Date().toLocaleDateString()}
-                                </span>
-                                <span class="badge bg-success">
-                                    <i class="bi bi-check-circle me-1"></i>已配置
-                                </span>
-                            </div>
-                            <div class="mb-2">
-                                <small class="text-muted me-2">标签:</small>
-                                ${tagsHtml}
-                            </div>
-                        </div>
-                        <div class="d-flex flex-column gap-1">
-                            <div class="btn-group" role="group">
-                                <button class="btn btn-outline-primary btn-sm" 
-                                        onclick="adminManager.testAccountWithDialog('${account.email}')"
-                                        title="测试邮件连接">
-                                    <i class="bi bi-play-circle me-1"></i>测试
-                                </button>
-                                <button class="btn btn-outline-info btn-sm" 
-                                        onclick="adminManager.showTagManagementDialog('${account.email}')"
-                                        title="管理标签">
-                                    <i class="bi bi-tags me-1"></i>标签
-                                </button>
-                            </div>
-                            <button class="btn btn-outline-danger btn-sm" 
-                                    onclick="adminManager.deleteAccount('${account.email}')"
-                                    title="删除账户">
-                                <i class="bi bi-trash me-1"></i>删除
+                <tr>
+                    <td class="small"><i class="bi bi-envelope me-1"></i>${account.email}</td>
+                    <td>${tagsHtml}</td>
+                    <td class="text-end">
+                        <div class="btn-group btn-group-sm" role="group">
+                            <button class="btn btn-outline-secondary btn-sm" 
+                                    onclick="adminManager.showTagManagementDialog('${account.email}')"
+                                    title="管理标签">
+                                <i class="bi bi-tags"></i>
                             </button>
                         </div>
-                    </div>
-                </div>
+                    </td>
+                </tr>
             `;
         }).join('');
-
-        accountsList.innerHTML = accountsHtml;
+        tbody.innerHTML = accountsHtml;
     }
 
-    async testAccountWithDialog(email) {
-        // 显示测试邮件对话框
-        const modal = new bootstrap.Modal(document.getElementById('testEmailResultModal'));
-        const modalTitle = document.getElementById('testEmailResultModalTitle');
-        const modalBody = document.getElementById('testEmailResultModalBody');
-        
-        modalTitle.textContent = `测试邮件连接 - ${email}`;
-        modalBody.innerHTML = `
-            <div class="text-center py-3">
-                <div class="spinner-border text-primary" role="status"></div>
-                <div class="mt-2">正在测试邮件连接...</div>
-            </div>
-        `;
-        
-        modal.show();
-        
-        try {
-            const response = await fetch('/api/test-email', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.token}`
-                },
-                body: JSON.stringify({ email: email })
-            });
+    // 已移除测试与系统配置相关功能
 
-            if (response.ok) {
-                const result = await response.json();
-                if (result.success) {
-                    if (result.data) {
-                        // 有邮件数据，显示最新邮件内容
-                        const emailData = result.data;
-                        const sender = emailData.sender?.emailAddress || emailData.from?.emailAddress || {};
-                        const senderName = sender.name || sender.address || '未知发件人';
-                        const subject = emailData.subject || '(无主题)';
-                        const date = this.formatDate(emailData.receivedDateTime);
-                        
-                        modalBody.innerHTML = `
-                            <div class="alert alert-success">
-                                <i class="bi bi-check-circle me-2"></i>
-                                <strong>测试成功！</strong> 成功获取到最新邮件
-                            </div>
-                            <div class="card">
-                                <div class="card-header">
-                                    <h6 class="mb-0">最新邮件信息</h6>
-                                </div>
-                                <div class="card-body">
-                                    <div class="row">
-                                        <div class="col-sm-3"><strong>发件人:</strong></div>
-                                        <div class="col-sm-9">${this.escapeHtml(senderName)}</div>
-                                    </div>
-                                    <div class="row mt-2">
-                                        <div class="col-sm-3"><strong>主题:</strong></div>
-                                        <div class="col-sm-9">${this.escapeHtml(subject)}</div>
-                                    </div>
-                                    <div class="row mt-2">
-                                        <div class="col-sm-3"><strong>时间:</strong></div>
-                                        <div class="col-sm-9">${date}</div>
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    } else {
-                        // 无邮件数据
-                        modalBody.innerHTML = `
-                            <div class="alert alert-info">
-                                <i class="bi bi-info-circle me-2"></i>
-                                <strong>测试成功！</strong> 连接正常，但该邮箱暂无邮件
-                            </div>
-                        `;
-                    }
-                } else {
-                    modalBody.innerHTML = `
-                        <div class="alert alert-danger">
-                            <i class="bi bi-exclamation-triangle me-2"></i>
-                            <strong>测试失败：</strong> ${result.message}
-                        </div>
-                    `;
-                }
-            } else {
-                modalBody.innerHTML = `
-                    <div class="alert alert-danger">
-                        <i class="bi bi-exclamation-triangle me-2"></i>
-                        <strong>测试失败：</strong> HTTP ${response.status}
-                    </div>
-                `;
-            }
-        } catch (error) {
-            console.error('测试邮件失败:', error);
-            modalBody.innerHTML = `
-                <div class="alert alert-danger">
-                    <i class="bi bi-exclamation-triangle me-2"></i>
-                    <strong>测试失败：</strong> ${error.message}
-                </div>
-            `;
-        }
-    }
-
-    async deleteAccount(email) {
-        if (!confirm(`确定要删除账号 ${email} 吗？此操作不可撤销。`)) {
-            return;
-        }
-
-        try {
-            const response = await fetch('/api/admin/accounts', {
-                method: 'DELETE',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${this.token}`
-                },
-                body: JSON.stringify({ email: email })
-            });
-
-            if (response.ok) {
-                const result = await response.json();
-                if (result.success) {
-                    this.showSuccess(`账号 ${email} 删除成功`);
-                    this.loadAccounts(); // 刷新列表
-                } else {
-                    this.showError(`删除失败: ${result.message}`);
-                }
-            } else {
-                this.showError(`删除失败: HTTP ${response.status}`);
-            }
-        } catch (error) {
-            console.error('删除账号失败:', error);
-            this.showError(`删除失败: ${error.message}`);
-        }
-    }
+    // 删除账户功能不在精简范围内，已移除调用
 
     clearImport() {
         document.getElementById('importTextarea').value = '';
@@ -486,11 +345,7 @@ class AdminManager {
 
     async exportData() {
         try {
-            const response = await fetch('/api/admin/export', {
-                headers: {
-                    'Authorization': `Bearer ${this.token}`
-                }
-            });
+            const response = await fetch('/api/export');
 
             if (response.ok) {
                 // 直接获取文本内容
@@ -508,7 +363,7 @@ class AdminManager {
                 
                 // 下载文件
                 this.downloadTextFile(content, filename);
-                this.showSuccess('数据导出成功，包含完整配置信息');
+                this.showSuccess('数据导出成功');
             } else {
                 throw new Error(`HTTP ${response.status}: ${response.statusText}`);
             }
@@ -829,228 +684,16 @@ class AdminManager {
         document.getElementById('currentAccountTags').style.display = 'none';
     }
     
-    // ==================== 系统配置功能 ====================
-    
-    async loadSystemConfig() {
-        const currentConfigDisplay = document.getElementById('currentConfigDisplay');
-        const emailLimitInput = document.getElementById('emailLimitInput');
-        
-        currentConfigDisplay.innerHTML = `
-            <div class="text-center py-3">
-                <div class="spinner-border spinner-border-sm text-primary" role="status"></div>
-                <div class="mt-2 small">加载配置中...</div>
-            </div>
-        `;
-        
-        try {
-            const response = await fetch('/api/system/config');
-            if (response.ok) {
-                const result = await response.json();
-                if (result.success) {
-                    const config = result.data;
-                    emailLimitInput.value = config.email_limit || 5;
-                    
-                    currentConfigDisplay.innerHTML = `
-                        <div class="row">
-                            <div class="col-md-6">
-                                <div class="d-flex justify-content-between">
-                                    <span>邮件获取限制:</span>
-                                    <strong>${config.email_limit || 5} 条</strong>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="mt-2 small text-muted">
-                            <i class="bi bi-info-circle me-1"></i>
-                            配置更新时间: ${new Date().toLocaleString()}
-                        </div>
-                    `;
-                } else {
-                    throw new Error(result.message);
-                }
-            } else {
-                throw new Error(`HTTP ${response.status}`);
-            }
-        } catch (error) {
-            console.error('加载系统配置失败:', error);
-            currentConfigDisplay.innerHTML = `
-                <div class="text-center py-3 text-danger">
-                    <i class="bi bi-exclamation-triangle"></i>
-                    <div class="mt-2 small">加载失败: ${error.message}</div>
-                </div>
-            `;
-        }
-    }
-    
-    async saveSystemConfig() {
-        const emailLimitInput = document.getElementById('emailLimitInput');
-        const emailLimit = parseInt(emailLimitInput.value);
-        
-        if (isNaN(emailLimit) || emailLimit < 1 || emailLimit > 50) {
-            this.showError('邮件限制必须是1-50之间的数字');
-            return;
-        }
-        
-        try {
-            const response = await fetch('/api/system/config', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ email_limit: emailLimit })
-            });
-            
-            if (response.ok) {
-                const result = await response.json();
-                if (result.success) {
-                    this.showSuccess('系统配置保存成功');
-                    this.loadSystemConfig(); // 刷新显示
-                } else {
-                    this.showError('保存失败: ' + result.message);
-                }
-            } else {
-                this.showError(`保存失败: HTTP ${response.status}`);
-            }
-        } catch (error) {
-            console.error('保存系统配置失败:', error);
-            this.showError('保存系统配置失败: ' + error.message);
-        }
-    }
-    
-    resetSystemConfig() {
-        document.getElementById('emailLimitInput').value = 5;
-        this.showSuccess('已重置为默认配置');
-    }
-    
-    // ==================== 测试邮件功能 ====================
-    
-    async showTestEmailModal() {
-        const testEmailInput = document.getElementById('testEmailInput');
-        
-        // 加载账户列表
-        try {
-            const response = await fetch('/api/accounts');
-            if (response.ok) {
-                const result = await response.json();
-                if (result.success) {
-                    testEmailInput.innerHTML = '<option value="">请选择要测试的邮箱...</option>';
-                    result.data.forEach(account => {
-                        const option = document.createElement('option');
-                        option.value = account.email;
-                        option.textContent = account.email;
-                        testEmailInput.appendChild(option);
-                    });
-                }
-            }
-        } catch (error) {
-            console.error('加载账户列表失败:', error);
-        }
-        
-        // 显示模态框
-        const modal = new bootstrap.Modal(document.getElementById('testEmailModal'));
-        modal.show();
-    }
-    
-    async executeEmailTest(event) {
-        event.preventDefault();
-        
-        const testEmailInput = document.getElementById('testEmailInput');
-        const testEmailResult = document.getElementById('testEmailResult');
-        const testEmailContent = document.getElementById('testEmailContent');
-        
-        const selectedEmail = testEmailInput.value;
-        if (!selectedEmail) {
-            this.showError('请选择要测试的邮箱');
-            return;
-        }
-        
-        // 显示加载状态
-        testEmailResult.style.display = 'block';
-        testEmailContent.innerHTML = `
-            <div class="text-center py-3">
-                <div class="spinner-border text-primary" role="status"></div>
-                <div class="mt-2">正在测试邮件连接...</div>
-            </div>
-        `;
-        
-        try {
-            const response = await fetch('/api/test-email', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ email: selectedEmail })
-            });
-            
-            if (response.ok) {
-                const result = await response.json();
-                if (result.success) {
-                    if (result.data) {
-                        // 有邮件数据
-                        const email = result.data;
-                        const sender = email.sender?.emailAddress || email.from?.emailAddress || {};
-                        const senderName = sender.name || sender.address || '未知发件人';
-                        const subject = email.subject || '(无主题)';
-                        const date = this.formatDate(email.receivedDateTime);
-                        
-                        testEmailContent.innerHTML = `
-                            <div class="alert alert-success">
-                                <i class="bi bi-check-circle me-2"></i>
-                                <strong>测试成功！</strong> 成功获取到最新邮件
-                            </div>
-                            <div class="card">
-                                <div class="card-header">
-                                    <h6 class="mb-0">最新邮件信息</h6>
-                                </div>
-                                <div class="card-body">
-                                    <div class="row">
-                                        <div class="col-sm-3"><strong>发件人:</strong></div>
-                                        <div class="col-sm-9">${this.escapeHtml(senderName)}</div>
-                                    </div>
-                                    <div class="row mt-2">
-                                        <div class="col-sm-3"><strong>主题:</strong></div>
-                                        <div class="col-sm-9">${this.escapeHtml(subject)}</div>
-                                    </div>
-                                    <div class="row mt-2">
-                                        <div class="col-sm-3"><strong>时间:</strong></div>
-                                        <div class="col-sm-9">${date}</div>
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    } else {
-                        // 无邮件数据
-                        testEmailContent.innerHTML = `
-                            <div class="alert alert-info">
-                                <i class="bi bi-info-circle me-2"></i>
-                                <strong>测试成功！</strong> 连接正常，但该邮箱暂无邮件
-                            </div>
-                        `;
-                    }
-                } else {
-                    testEmailContent.innerHTML = `
-                        <div class="alert alert-danger">
-                            <i class="bi bi-exclamation-triangle me-2"></i>
-                            <strong>测试失败：</strong> ${result.message}
-                        </div>
-                    `;
-                }
-            } else {
-                testEmailContent.innerHTML = `
-                    <div class="alert alert-danger">
-                        <i class="bi bi-exclamation-triangle me-2"></i>
-                        <strong>测试失败：</strong> HTTP ${response.status}
-                    </div>
-                `;
-            }
-        } catch (error) {
-            console.error('测试邮件失败:', error);
-            testEmailContent.innerHTML = `
-                <div class="alert alert-danger">
-                    <i class="bi bi-exclamation-triangle me-2"></i>
-                    <strong>测试失败：</strong> ${error.message}
-                </div>
-            `;
-        }
+    // ==================== 分页信息渲染 ====================
+    renderPager() {
+        const info = document.getElementById('accountsPagerInfo');
+        if (!info) return;
+        const maxPage = Math.max(1, Math.ceil(this.total / this.pageSize));
+        info.textContent = `第 ${this.page} / ${maxPage} 页，共 ${this.total} 条`;
+        const prevBtn = document.getElementById('prevPageBtn');
+        const nextBtn = document.getElementById('nextPageBtn');
+        if (prevBtn) prevBtn.disabled = this.page <= 1;
+        if (nextBtn) nextBtn.disabled = this.page >= maxPage;
     }
     
     // ==================== 辅助方法 ====================

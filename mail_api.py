@@ -479,6 +479,130 @@ async def get_accounts(authorization: Optional[str] = Header(None)) -> ApiRespon
         return ApiResponse(success=False, message="获取账户列表失败")
 
 # ============================================================================
+# 管理端相关与分页/搜索/标签API
+# ============================================================================
+
+@app.post("/api/admin/verify")
+async def admin_verify(request: AdminTokenRequest) -> ApiResponse:
+    """验证管理令牌"""
+    try:
+        if verify_admin_token(request.token):
+            return ApiResponse(success=True, message="验证成功")
+        return ApiResponse(success=False, message="令牌无效")
+    except Exception as e:
+        logger.error(f"验证管理令牌失败: {e}")
+        return ApiResponse(success=False, message="验证失败")
+
+
+@app.get("/api/accounts/paged")
+async def get_accounts_paged(q: Optional[str] = None,
+                             page: int = 1,
+                             page_size: int = 10,
+                             authorization: Optional[str] = Header(None)) -> ApiResponse:
+    """分页与搜索账户列表
+    - q: 按邮箱子串搜索（不区分大小写）
+    - page/page_size: 分页参数
+    """
+    try:
+        # 可选的管理鉴权（目前不强制）
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+            _ = verify_admin_token(token)
+
+        accounts_dict = await load_accounts_config()
+        emails = sorted(accounts_dict.keys())
+
+        if q:
+            q_lower = q.strip().lower()
+            emails = [e for e in emails if q_lower in e.lower()]
+
+        total = len(emails)
+        # 规范分页参数
+        page = max(1, page)
+        page_size = max(1, min(100, page_size))
+        start = (page - 1) * page_size
+        end = start + page_size
+        items = [{"email": e} for e in emails[start:end]]
+
+        return ApiResponse(
+            success=True,
+            data={
+                "items": items,
+                "total": total,
+                "page": page,
+                "page_size": page_size
+            },
+            message=f"共 {total} 个账户"
+        )
+    except Exception as e:
+        logger.error(f"分页获取账户列表失败: {e}")
+        return ApiResponse(success=False, message="获取账户列表失败")
+
+
+@app.get("/api/accounts/tags")
+async def get_accounts_tags(authorization: Optional[str] = Header(None)) -> ApiResponse:
+    """获取所有标签和账户-标签映射"""
+    try:
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+            _ = verify_admin_token(token)
+
+        tags = await db_manager.get_all_tags()
+        accounts_map = await db_manager.get_accounts_with_tags()
+        return ApiResponse(success=True, data={"tags": tags, "accounts": accounts_map})
+    except Exception as e:
+        logger.error(f"获取账户标签失败: {e}")
+        return ApiResponse(success=False, message="获取账户标签失败")
+
+
+@app.get("/api/account/{email}/tags")
+async def get_account_tags(email: str, authorization: Optional[str] = Header(None)) -> ApiResponse:
+    """获取指定账户的标签"""
+    try:
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization[7:]
+            _ = verify_admin_token(token)
+
+        tags = await db_manager.get_account_tags(email)
+        return ApiResponse(success=True, data={"email": email, "tags": tags})
+    except Exception as e:
+        logger.error(f"获取账户标签失败({email}): {e}")
+        return ApiResponse(success=False, message="获取账户标签失败")
+
+
+@app.post("/api/account/{email}/tags")
+async def set_account_tags(email: str, request: AccountTagRequest, authorization: Optional[str] = Header(None)) -> ApiResponse:
+    """设置指定账户的标签"""
+    try:
+        # 需要管理认证
+        _ = get_admin_token(authorization)
+
+        # 保护：路径中的邮箱与请求体邮箱需一致（若请求体提供）
+        if request.email and request.email != email:
+            return ApiResponse(success=False, message="邮箱不一致")
+
+        # 去重并清理空白
+        cleaned_tags = []
+        seen = set()
+        for t in (request.tags or []):
+            tag = (t or "").strip()
+            if not tag:
+                continue
+            if tag not in seen:
+                seen.add(tag)
+                cleaned_tags.append(tag)
+
+        ok = await db_manager.set_account_tags(email, cleaned_tags)
+        if ok:
+            return ApiResponse(success=True, message="标签已保存", data={"email": email, "tags": cleaned_tags})
+        return ApiResponse(success=False, message="保存标签失败")
+    except HTTPException as e:
+        return ApiResponse(success=False, message=e.detail)
+    except Exception as e:
+        logger.error(f"保存账户标签失败({email}): {e}")
+        return ApiResponse(success=False, message="保存标签失败")
+
+# ============================================================================
 # 账户导入/导出API端点
 # ============================================================================
 
