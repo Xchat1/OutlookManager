@@ -1,188 +1,38 @@
 #!/usr/bin/env python3
 """
-Microsoft邮件处理脚本
-用于批量管理Microsoft账号的邮件
-支持批量导入账户和前端界面
+Microsoft邮件管理API
 基于FastAPI的现代化异步实现
-使用IMAP协议访问邮件（参考exp.py的成功实现）
+重构版本：使用模块化架构
 """
 
 import asyncio
 import json
 import logging
-import time
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 from pathlib import Path
-import imaplib
-import email
-from email.header import decode_header
-from email import utils as email_utils
-import requests
-import threading
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, EmailStr, ValidationError
 
-# 导入数据库管理器
+# 导入自定义模块
 from database import db_manager
-
-# 移除代理相关代码，以兼容Docker环境
-
-# ============================================================================
-# 数据模型 (Pydantic)
-# ============================================================================
-
-class EmailVerifyRequest(BaseModel):
-    email: EmailStr
-
-class EmailListRequest(BaseModel):
-    email: EmailStr
-    top: int = 5
-
-class EmailDetailRequest(BaseModel):
-    email: EmailStr
-    message_id: str
-
-class ApiResponse(BaseModel):
-    success: bool
-    message: str = ""
-    data: Optional[Union[Dict, List, str]] = None
-
-class AccountCredentials(BaseModel):
-    email: EmailStr
-    password: str
-    client_id: str
-    refresh_token: str
-
-class ImportAccountData(BaseModel):
-    """单个导入账户数据模型"""
-    email: str  # 暂时使用str而不EmailStr避免验证问题
-    password: str = ""
-    client_id: str = ""
-    refresh_token: str
-
-class ImportRequest(BaseModel):
-    """批量导入请求模型"""
-    accounts: List[ImportAccountData]
-    merge_mode: str = "update"  # "update": 更新现有账户, "skip": 跳过重复账户, "replace": 替换所有数据
-
-class ParsedImportRequest(BaseModel):
-    """解析后的导入请求模型（包含解析统计信息）"""
-    accounts: List[ImportAccountData]
-    parsed_count: int
-    error_count: int
-    errors: List[str]
-    merge_mode: str = "update"
-
-class ImportResult(BaseModel):
-    """导入结果模型"""
-    success: bool
-    total_count: int
-    added_count: int
-    updated_count: int
-    skipped_count: int
-    error_count: int
-    details: List[Dict[str, str]]  # 详细信息
-    message: str
-
-class AdminTokenRequest(BaseModel):
-    """管理令牌验证请求"""
-    token: str
-
-class DeleteAccountRequest(BaseModel):
-    """删除账户请求"""
-    email: EmailStr
-
-class TempAccountRequest(BaseModel):
-    """临时账户请求"""
-    email: EmailStr
-    password: str = ""
-    client_id: str = ""
-    refresh_token: str
-    top: int = 5
-
-class TempMessageDetailRequest(BaseModel):
-    """临时账户邮件详情请求"""
-    email: EmailStr
-    password: str = ""
-    client_id: str = ""
-    refresh_token: str
-    message_id: str
-
-class SystemConfigRequest(BaseModel):
-    """系统配置请求"""
-    email_limit: int = 5
-
-class AccountTagRequest(BaseModel):
-    """账户标签请求"""
-    email: EmailStr
-    tags: List[str] = []
-
-class TestEmailRequest(BaseModel):
-    """测试邮件请求模型"""
-    email: EmailStr
-    password: str = ""
-    client_id: str = ""
-    refresh_token: str = ""
-
-# ============================================================================
-# 配置常量
-# ============================================================================
-
-# 使用exp.py中验证有效的CLIENT_ID
-CLIENT_ID = 'dbc8e03a-b00c-46bd-ae65-b683e7707cb0'
-TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
-IMAP_SERVER = 'outlook.live.com'
-IMAP_PORT = 993
-INBOX_FOLDER_NAME = "INBOX"
-JUNK_FOLDER_NAME = "Junk"
-
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# 管理认证配置
-ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', 'admin123')  # 从环境变量获取，默认为admin123
-
-# 系统配置
-DEFAULT_EMAIL_LIMIT = 5  # 默认邮件获取数量限制
+from models import (
+    ApiResponse, ImportAccountData, ImportResult, AdminTokenRequest,
+    DeleteAccountRequest, TempAccountRequest, SystemConfigRequest,
+    AccountTagRequest, TestEmailRequest
+)
+from config import CLIENT_ID, ADMIN_TOKEN, DEFAULT_EMAIL_LIMIT, logger
+from imap_client import IMAPEmailClient
 
 # ============================================================================
 # 辅助函数
 # ============================================================================
-
-def decode_header_value(header_value):
-    """解码邮件头部信息（来自exp.py）"""
-    if header_value is None: 
-        return ""
-    decoded_string = ""
-    try:
-        parts = decode_header(str(header_value))
-        for part, charset in parts:
-            if isinstance(part, bytes):
-                try: 
-                    decoded_string += part.decode(charset if charset else 'utf-8', 'replace')
-                except LookupError: 
-                    decoded_string += part.decode('utf-8', 'replace')
-            else: 
-                decoded_string += str(part)
-    except Exception:
-        if isinstance(header_value, str): 
-            return header_value
-        try: 
-            return str(header_value, 'utf-8', 'replace') if isinstance(header_value, bytes) else str(header_value)
-        except: 
-            return "[Header Decode Error]"
-    return decoded_string
 
 def verify_admin_token(token: str) -> bool:
     """验证管理令牌"""
@@ -204,9 +54,8 @@ def get_admin_token(authorization: Optional[str] = Header(None)) -> str:
     return token
 
 async def load_accounts_config() -> Dict[str, Dict[str, str]]:
-    """从数据库加载批量账户信息（异步版本）"""
+    """从数据库加载批量账户信息"""
     try:
-        # 首先尝试从数据库加载
         accounts = await db_manager.get_all_accounts()
         
         # 如果数据库为空，尝试从config.txt迁移
@@ -229,7 +78,6 @@ async def save_accounts_config(accounts: Dict[str, Dict[str, str]]) -> bool:
     """保存账户信息到配置文件（异步版本）"""
     def _sync_save():
         try:
-            # 先读取现有的注释和头部信息
             header_lines = []
             if Path('config.txt').exists():
                 with open('config.txt', 'r', encoding='utf-8') as f:
@@ -238,9 +86,8 @@ async def save_accounts_config(accounts: Dict[str, Dict[str, str]]) -> bool:
                         if stripped.startswith('#') or not stripped:
                             header_lines.append(line.rstrip())
                         else:
-                            break  # 遇到第一个非注释行就停止
+                            break
             
-            # 如果没有头部注释，添加默认的
             if not header_lines:
                 header_lines = [
                     '# 批量邮箱账户配置文件',
@@ -249,17 +96,13 @@ async def save_accounts_config(accounts: Dict[str, Dict[str, str]]) -> bool:
                     ''
                 ]
             
-            # 写入新的配置文件
             with open('config.txt', 'w', encoding='utf-8') as f:
-                # 写入头部注释
                 for line in header_lines:
                     f.write(line + '\n')
                 
-                # 写入账户信息
                 for email, info in accounts.items():
                     password = info.get('password', '')
                     refresh_token = info.get('refresh_token', '')
-                    # 使用全局固定的CLIENT_ID
                     line = f"{email}----{password}----{CLIENT_ID}----{refresh_token}"
                     f.write(line + '\n')
             
@@ -317,16 +160,7 @@ async def set_system_config_value(key: str, value: any) -> bool:
 async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]], 
                              new_accounts: List[ImportAccountData], 
                              merge_mode: str = "update") -> ImportResult:
-    """合并账户数据
-    
-    Args:
-        existing_accounts: 现有账户数据
-        new_accounts: 新导入的账户数据
-        merge_mode: 合并模式（update/skip/replace）
-        
-    Returns:
-        ImportResult: 导入结果
-    """
+    """合并账户数据"""
     result = ImportResult(
         success=True,
         total_count=len(new_accounts),
@@ -339,7 +173,6 @@ async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]],
     )
     
     if merge_mode == "replace":
-        # 替换模式：清空现有数据
         existing_accounts.clear()
         result.details.append({"action": "clear", "message": "清空现有账户数据"})
     
@@ -353,7 +186,6 @@ async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]],
             
             if email in existing_accounts:
                 if merge_mode == "skip":
-                    # 跳过模式：不更新现有账户
                     result.skipped_count += 1
                     result.details.append({
                         "email": email, 
@@ -361,7 +193,6 @@ async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]],
                         "message": "账户已存在，跳过更新"
                     })
                 else:
-                    # 更新模式：更新现有账户
                     existing_accounts[email] = new_info
                     result.updated_count += 1
                     result.details.append({
@@ -370,7 +201,6 @@ async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]],
                         "message": "更新账户信息"
                     })
             else:
-                # 新增账户
                 existing_accounts[email] = new_info
                 result.added_count += 1
                 result.details.append({
@@ -398,441 +228,16 @@ async def merge_accounts_data(existing_accounts: Dict[str, Dict[str, str]],
     return result
 
 # ============================================================================
-# OAuth2令牌获取模块（异步版本）
+# 邮件管理器
 # ============================================================================
 
-async def get_access_token(refresh_token: str, check_only: bool = False) -> Optional[str]:
-    """使用refresh_token获取access_token（参考exp.py的实现）
-    
-    Args:
-        refresh_token: 刷新令牌
-        check_only: 如果为True，验证失败时返回None而不是抛出异常
-        
-    Returns:
-        成功返回access_token，如果check_only=True且验证失败则返回None
-    """
-    logger.info("正在获取新的 access_token...")
-    
-    data = {
-        'client_id': CLIENT_ID,
-        'grant_type': 'refresh_token',
-        'refresh_token': refresh_token,
-        'scope': 'https://outlook.office.com/IMAP.AccessAsUser.All offline_access'
-    }
-    
-    try:
-        # 使用requests而不是httpx，因为exp.py验证有效
-        response = requests.post(TOKEN_URL, data=data)
-        response.raise_for_status()
-        
-        token_data = response.json()
-        access_token = token_data.get('access_token')
-        
-        if not access_token:
-            error_msg = f"获取 access_token 失败: {token_data.get('error_description', '响应中未找到 access_token')}"
-            logger.error(error_msg)
-            if check_only:
-                return None
-            raise HTTPException(status_code=401, detail=error_msg)
-        
-        new_refresh_token = token_data.get('refresh_token')
-        if new_refresh_token and new_refresh_token != refresh_token:
-            logger.info("提示: refresh_token 已被服务器更新。")
-        
-        logger.info("成功获取 access_token。")
-        return access_token
-    
-    except requests.exceptions.HTTPError as http_err:
-        logger.error(f"请求 access_token 时发生HTTP错误: {http_err}")
-        if http_err.response is not None:
-            logger.error(f"服务器响应: {http_err.response.status_code} - {http_err.response.text}")
-        
-        if check_only:
-            return None
-        raise HTTPException(status_code=401, detail="Refresh token已过期或无效，需要重新获取授权")
-    
-    except requests.exceptions.RequestException as e:
-        logger.error(f"请求 access_token 时发生网络错误: {e}")
-        if check_only:
-            return None
-        raise HTTPException(status_code=500, detail="Token acquisition failed")
-    
-    except Exception as e:
-        logger.error(f"解析 access_token 响应时出错: {e}")
-        if check_only:
-            return None
-        raise HTTPException(status_code=500, detail="Token acquisition failed")
-
-class EmailClient:
-    def __init__(self, email: str, account_info: Dict):
-        """初始化邮件客户端（基于IMAP协议，按需连接模式）
-        
-        Args:
-            email: 邮箱地址
-            account_info: 包含refresh_token的账户信息
-        """
-        self.email = email
-        self.refresh_token = account_info['refresh_token']
-        self.access_token = ''
-        self.expires_at = 0
-        
-        # 移除IMAP连接相关的持久化状态
-        # 改为按需连接，用完即关闭的模式
-        
-        # 添加并发控制锁（仅用于token管理）
-        self._token_lock = asyncio.Lock()
-        
-        logger.info(f"EmailClient初始化完成 ({email})，采用按需连接策略")
-    
-    def is_token_expired(self) -> bool:
-        """检查access token是否过期或即将过期"""
-        buffer_time = 300  # 5分钟缓冲时间
-        return datetime.now().timestamp() + buffer_time >= self.expires_at
-    
-    async def ensure_token_valid(self):
-        """确保token有效（异步版本，带并发控制）"""
-        async with self._token_lock:
-            if not self.access_token or self.is_token_expired():
-                logger.info(f"{self.email} access token已过期或不存在，需要刷新")
-                await self.refresh_access_token()
-    
-    async def refresh_access_token(self) -> None:
-        """刷新访问令牌（异步版本）"""
-        try:
-            logger.info(f"正在为 {self.email} 刷新access token...")
-            access_token = await get_access_token(self.refresh_token)
-            
-            if access_token:
-                self.access_token = access_token
-                self.expires_at = time.time() + 3600  # 默认1小时过期
-                expires_at_str = datetime.fromtimestamp(self.expires_at).strftime('%Y-%m-%d %H:%M:%S')
-                logger.info(f"{self.email} access token刷新成功，过期时间: {expires_at_str}")
-            else:
-                raise HTTPException(status_code=401, detail="Failed to refresh access token")
-                
-        except Exception as e:
-            logger.error(f"刷新访问令牌失败 {self.email}: {e}")
-            raise
-    
-    async def create_imap_connection(self, mailbox_to_select=INBOX_FOLDER_NAME):
-        """创建IMAP连接（按需创建，带超时和重试）"""
-        # 确保token有效
-        await self.ensure_token_valid()
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"正在为 {self.email} 创建IMAP连接到 {mailbox_to_select}... (第{attempt+1}次尝试)")
-                
-                def _sync_connect():
-                    imap_conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-                    auth_string = f"user={self.email}\1auth=Bearer {self.access_token}\1\1"
-                    logger.info(f"正在为 {self.email} 使用 XOAUTH2 进行认证...")
-                    typ, data = imap_conn.authenticate('XOAUTH2', lambda x: auth_string.encode('utf-8'))
-                    
-                    if typ == 'OK':
-                        logger.info(f"IMAP XOAUTH2 认证成功 ({self.email})。")
-                        # 选择邮箱
-                        stat_select, data_select = imap_conn.select(mailbox_to_select, readonly=True)
-                        if stat_select == 'OK':
-                            return imap_conn
-                        else:
-                            error_msg = data_select[0].decode('utf-8', 'replace') if data_select and data_select[0] else "未知错误"
-                            raise Exception(f"选择邮箱 '{mailbox_to_select}' 失败: {error_msg}")
-                    else:
-                        error_message = data[0].decode('utf-8', 'replace') if data and data[0] else "未知认证错误"
-                        raise Exception(f"IMAP XOAUTH2 认证失败: {error_message} (Type: {typ})")
-                
-                # 在线程池中执行，带10秒超时
-                imap_conn = await asyncio.wait_for(
-                    asyncio.to_thread(_sync_connect), timeout=10.0
-                )
-                logger.info(f"成功创建IMAP连接 ({self.email})")
-                return imap_conn
-                
-            except asyncio.TimeoutError:
-                logger.error(f"创建IMAP连接超时 ({self.email}), 第{attempt+1}次尝试")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)  # 等待1秒后重试
-                    continue
-            except Exception as e:
-                logger.error(f"创建IMAP连接失败 ({self.email}), 第{attempt+1}次尝试: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1)  # 等待1秒后重试
-                    continue
-        
-        logger.error(f"经过{max_retries}次尝试，仍无法创建IMAP连接 ({self.email})")
-        raise HTTPException(status_code=500, detail=f"Failed to connect to IMAP server for {self.email}")
-    
-    def close_imap_connection(self, imap_conn):
-        """安全关闭IMAP连接"""
-        if imap_conn:
-            try:
-                logger.info(f"正在关闭IMAP连接 ({self.email})...")
-                current_state = getattr(imap_conn, 'state', None)
-                
-                # 安全关闭连接，忽略可能的EOF错误
-                try:
-                    if current_state == 'SELECTED':
-                        imap_conn.close()
-                except Exception as e:
-                    logger.debug(f"关闭邮箱时出现预期错误 ({self.email}): {e}")
-                
-                try:
-                    if current_state != 'LOGOUT':
-                        imap_conn.logout()
-                except Exception as e:
-                    logger.debug(f"登出时出现预期错误 ({self.email}): {e}")
-                
-                logger.info(f"IMAP连接已安全关闭 ({self.email})")
-            except Exception as e:
-                logger.debug(f"关闭IMAP连接时发生预期错误 ({self.email}): {e}")
-                # 这些错误是正常的，不需要记录为ERROR级别
-
-    async def get_messages(self, folder_id: str = INBOX_FOLDER_NAME, top: int = 5) -> List[Dict]:
-        """获取指定文件夹的邮件（使用IMAP协议，按需连接模式）
-        
-        Args:
-            folder_id: 文件夹ID, 默认为'INBOX'
-            top: 获取的邮件数量
-        """
-        logger.info(f"正在为 {self.email} 获取邮件列表（文件夹: {folder_id}, 数量: {top}）")
-        
-        # 创建临时IMAP连接
-        imap_conn = None
-        try:
-            imap_conn = await self.create_imap_connection(folder_id)
-            
-            def _sync_get_messages():
-                # 搜索所有邮件
-                typ, uid_data = imap_conn.uid('search', None, "ALL")
-                if typ != 'OK':
-                    raise Exception(f"在 '{folder_id}' 中搜索邮件失败 (status: {typ})。")
-                
-                if not uid_data[0]:
-                    return []
-                
-                uids = uid_data[0].split()
-                logger.info(f"{folder_id} 共有 {len(uids)} 封邮件")
-                
-                # 只获取最新的top条邮件
-                uids = uids[-top:] if len(uids) > top else uids
-                uids.reverse()  # 最新的在前
-                
-                messages = []
-                for uid_bytes in uids:
-                    try:
-                        # 获取邮件头部信息
-                        typ, msg_data = imap_conn.uid('fetch', uid_bytes, 
-                                                     '(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE FROM)] INTERNALDATE)')
-                        
-                        if typ == 'OK' and msg_data:
-                            subject_str = "(No Subject)"
-                            from_name = "(Unknown)"
-                            from_email = ""
-                            date_str = "(No Date)"
-                            
-                            # 解析邮件头部
-                            header_content_bytes = None
-                            if isinstance(msg_data[0], tuple) and len(msg_data[0]) == 2:
-                                if isinstance(msg_data[0][1], bytes):
-                                    header_content_bytes = msg_data[0][1]
-                            
-                            if header_content_bytes:
-                                header_message = email.message_from_bytes(header_content_bytes)
-                                subject_str = decode_header_value(header_message.get('Subject', '(No Subject)'))
-                                from_str = decode_header_value(header_message.get('From', '(Unknown Sender)'))
-                                date_header_str = header_message.get('Date')
-                                
-                                # 解析From字段
-                                if '<' in from_str and '>' in from_str:
-                                    from_name = from_str.split('<')[0].strip().strip('"')
-                                    from_email = from_str.split('<')[1].split('>')[0].strip()
-                                else:
-                                    from_email = from_str.strip()
-                                    if '@' in from_email:
-                                        from_name = from_email.split('@')[0]
-                                
-                                # 解析日期
-                                if date_header_str:
-                                    try:
-                                        dt_obj = email_utils.parsedate_to_datetime(date_header_str)
-                                        if dt_obj:
-                                            date_str = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
-                                    except Exception:
-                                        date_str = date_header_str[:25] if date_header_str else "(No Date)"
-                            
-                            # 构建邮件信息（兼容前端格式）
-                            message = {
-                                'id': uid_bytes.decode('utf-8'),
-                                'subject': subject_str,
-                                'receivedDateTime': date_str,
-                                'sender': {
-                                    'emailAddress': {
-                                        'address': from_email,
-                                        'name': from_name
-                                    }
-                                },
-                                'from': {  # 兼容字段
-                                    'emailAddress': {
-                                        'address': from_email,
-                                        'name': from_name
-                                    }
-                                },
-                                'body': {
-                                    'content': '',
-                                    'contentType': 'text'
-                                },
-                                'bodyPreview': ''
-                            }
-                            messages.append(message)
-                            
-                    except Exception as e:
-                        logger.error(f"处理邮件UID {uid_bytes}时出错: {e}")
-                        continue
-                
-                return messages
-            
-            # 在线程池中执行同步IMAP操作
-            messages = await asyncio.to_thread(_sync_get_messages)
-            
-            logger.info(f"成功获取 {self.email} 的 {len(messages)} 封邮件")
-            return messages
-            
-        except asyncio.CancelledError:
-            logger.warning(f"获取邮件操作被取消 ({self.email})")
-            raise
-        except Exception as e:
-            logger.error(f"获取邮件失败 {self.email}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to retrieve emails")
-        finally:
-            # 确保连接被关闭
-            if imap_conn:
-                self.close_imap_connection(imap_conn)
-
-    async def get_message_detail(self, message_id: str) -> Dict:
-        """获取邮件详情（使用IMAP协议，按需连接模式）"""
-        logger.info(f"正在为 {self.email} 获取邮件详情: {message_id}")
-        
-        # 创建临时IMAP连接
-        imap_conn = None
-        try:
-            imap_conn = await self.create_imap_connection()
-            
-            def _sync_get_detail():
-                message_uid = message_id.encode('utf-8') if isinstance(message_id, str) else message_id
-                typ, msg_data = imap_conn.uid('fetch', message_uid, '(RFC822)')
-                
-                if typ == 'OK' and msg_data and msg_data[0] is not None:
-                    raw_email_bytes = None
-                    if isinstance(msg_data[0], tuple) and len(msg_data[0]) == 2:
-                        raw_email_bytes = msg_data[0][1]
-                    
-                    if raw_email_bytes:
-                        email_message = email.message_from_bytes(raw_email_bytes)
-                        subject = decode_header_value(email_message['Subject']) or "(No Subject)"
-                        from_ = decode_header_value(email_message['From']) or "(Unknown Sender)"
-                        to_ = decode_header_value(email_message['To']) or "(Unknown Recipient)"
-                        date_ = email_message['Date'] or "(Unknown Date)"
-                        
-                        # 解析邮件正文，优先获取HTML格式
-                        body_content = ""
-                        body_type = "text"
-                        
-                        if email_message.is_multipart():
-                            # 优先查找HTML部分
-                            html_content = None
-                            text_content = None
-                            
-                            for part in email_message.walk():
-                                content_type = part.get_content_type()
-                                content_disposition = str(part.get("Content-Disposition"))
-                                
-                                if 'attachment' not in content_disposition.lower():
-                                    try:
-                                        charset = part.get_content_charset() or 'utf-8'
-                                        payload = part.get_payload(decode=True)
-                                        
-                                        if content_type == 'text/html' and not html_content:
-                                            html_content = payload.decode(charset, errors='replace')
-                                        elif content_type == 'text/plain' and not text_content:
-                                            text_content = payload.decode(charset, errors='replace')
-                                    except Exception:
-                                        continue
-                            
-                            # 优先使用HTML内容
-                            if html_content:
-                                body_content = html_content
-                                body_type = "html"
-                            elif text_content:
-                                body_content = text_content
-                                body_type = "text"
-                            else:
-                                body_content = "[未找到可读的邮件内容]"
-                        else:
-                            # 非多部分邮件
-                            try:
-                                charset = email_message.get_content_charset() or 'utf-8'
-                                payload = email_message.get_payload(decode=True)
-                                body_content = payload.decode(charset, errors='replace')
-                                
-                                # 检查是否为HTML内容
-                                if '<html' in body_content.lower() or '<body' in body_content.lower():
-                                    body_type = "html"
-                            except Exception:
-                                body_content = "[Failed to decode email body]"
-                        
-                        if not body_content:
-                            body_content = "[未找到可读的文本内容]"
-                        
-                        return {
-                            'id': message_id,
-                            'subject': subject,
-                            'sender': {'emailAddress': {'address': from_.strip(), 'name': from_.strip()}},
-                            'toRecipients': [{'emailAddress': {'address': to_.strip(), 'name': to_.strip()}}],
-                            'receivedDateTime': date_,
-                            'body': {'content': body_content, 'contentType': body_type}
-                        }
-                    else:
-                        raise Exception("未能提取邮件数据")
-                else:
-                    raise Exception(f"获取邮件失败: {typ}")
-            
-            result = await asyncio.to_thread(_sync_get_detail)
-            logger.info(f"成功获取 {self.email} 的邮件详情")
-            return result
-            
-        except asyncio.CancelledError:
-            logger.warning(f"获取邮件详情操作被取消 ({self.email})")
-            raise
-        except Exception as e:
-            logger.error(f"获取邮件详情失败 {self.email}: {e}")
-            raise HTTPException(status_code=500, detail="Failed to retrieve email details")
-        finally:
-            # 确保连接被关闭
-            if imap_conn:
-                self.close_imap_connection(imap_conn)
-
-    async def cleanup(self):
-        """清理资源（新模式下不再需要清理持久化连接）"""
-        # 在新的按需连接模式下，不需要特别的清理操作
-        # 因为每次操作后都会自动关闭连接
-        logger.info(f"EmailClient清理完成 ({self.email})，按需连接模式无需额外清理")
-
-    def __del__(self):
-        """析构函数（新模式下不需要特别处理）"""
-        # 新模式下不需要特别的清理操作
-        pass
-
 class EmailManager:
-    """邮件管理器，负责管理多个邮箱账户（异步版本，支持并发及资源优化）"""
+    """邮件管理器，负责管理多个邮箱账户"""
     
     def __init__(self):
         self.clients = {}
         self._accounts = None
-        # 延迟初始化锁，在需要时创建
         self._clients_lock = None
-        # 移除清理任务相关的属性，因为不再需要连接保活
         
     async def _load_accounts(self):
         """加载账户配置（懒加载）"""
@@ -840,9 +245,8 @@ class EmailManager:
             self._accounts = await load_accounts_config()
         return self._accounts
         
-    async def get_client(self, email: str) -> Optional[EmailClient]:
+    async def get_client(self, email: str) -> Optional[IMAPEmailClient]:
         """获取指定邮箱的客户端（带并发控制）"""
-        # 确保锁已初始化
         if self._clients_lock is None:
             self._clients_lock = asyncio.Lock()
             
@@ -852,7 +256,7 @@ class EmailManager:
                 return None
                 
             if email not in self.clients:
-                self.clients[email] = EmailClient(email, accounts[email])
+                self.clients[email] = IMAPEmailClient(email, accounts[email])
                 
             return self.clients[email]
     
@@ -862,15 +266,15 @@ class EmailManager:
         return email in accounts
     
     async def get_messages(self, email: str, top: int = 5) -> List[Dict]:
-        """获取指定邮箱的邮件列表"""
+        """获取指定邮箱的邮件列表（包含完整内容）"""
         client = await self.get_client(email)
         if not client:
             raise HTTPException(status_code=404, detail=f"邮箱 {email} 未在配置中找到")
         
         try:
-            return await client.get_messages(top=top)
+            # 使用优化后的方法：一次性获取完整邮件内容
+            return await client.get_messages_with_content(top=top)
         except HTTPException as e:
-            # 检查是否是refresh token过期问题
             if "refresh token" in e.detail.lower() or "token" in e.detail.lower():
                 raise HTTPException(
                     status_code=401, 
@@ -878,19 +282,9 @@ class EmailManager:
                 )
             raise
     
-    async def get_message_detail(self, email: str, message_id: str) -> Dict:
-        """获取指定邮箱的邮件详情"""
-        client = await self.get_client(email)
-        if not client:
-            raise HTTPException(status_code=404, detail=f"邮箱 {email} 未在配置中找到")
-        
-        return await client.get_message_detail(message_id)
-    
     async def cleanup_all(self):
-        """清理所有资源（新模式下简化处理）"""
+        """清理所有资源"""
         try:
-            # 新模式下不需要特别的连接清理
-            # 因为每次操作后都会自动关闭连接
             if self._clients_lock:
                 async with self._clients_lock:
                     for email, client in self.clients.items():
@@ -913,17 +307,12 @@ class EmailManager:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用程序生命周期管理"""
-    # 启动时的初始化
     logger.info("启动邮件管理系统...")
     logger.info("初始化数据库...")
-    # 数据库已在导入时初始化
     yield
-    # 关闭时的清理
     logger.info("正在关闭邮件管理系统...")
     try:
-        # 使用新的清理方法
         await email_manager.cleanup_all()
-        # 关闭数据库连接
         db_manager.close()
     except Exception as e:
         logger.error(f"清理系统资源时出错: {e}")
@@ -931,8 +320,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Outlook邮件管理系统",
-    description="基于FastAPI的现代化异步邮件管理服务",
-    version="2.0.0",
+    description="基于FastAPI的现代化异步邮件管理服务（重构版）",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -967,27 +356,30 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # 创建邮件管理器实例
 email_manager = EmailManager()
 
+# ============================================================================
+# 前端页面路由
+# ============================================================================
+
 @app.get("/")
 async def root():
-    """根路径 - 返回前端页面"""
-    return FileResponse("static/index.html")
+    """根路径 - 返回简化版前端页面"""
+    return FileResponse("static/index_simple.html")
 
-# CSS和JS文件的直接路由
+
 @app.get("/style.css")
 async def style_css():
     """CSS文件 - 带缓存控制"""
     response = FileResponse("static/style.css")
-    # 禁止缓存，确保浏览器获取最新样式
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
 
-@app.get("/script.js")
-async def script_js():
-    """JavaScript文件 - 带缓存控制"""
-    response = FileResponse("static/script.js")
-    # 禁止缓存，确保浏览器获取最新的JavaScript代码
+
+@app.get("/script_simple.js")
+async def script_simple_js():
+    """简化版JavaScript文件 - 带缓存控制"""
+    response = FileResponse("static/script_simple.js")
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -1002,20 +394,21 @@ async def admin_page():
 async def admin_js():
     """管理页面JavaScript文件 - 带缓存控制"""
     response = FileResponse("static/admin.js")
-    # 禁止缓存，确保浏览器获取最新的JavaScript代码
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     return response
 
-@app.get("/admin.js")
-async def admin_js():
-    """管理页面JavaScript文件"""
-    return FileResponse("static/admin.js")
+# ============================================================================
+# 邮件API端点
+# ============================================================================
 
 @app.get("/api/messages")
 async def get_messages(email: str, top: int = None) -> ApiResponse:
-    """获取邮件列表"""
+    """获取邮件列表（包含完整内容）
+    
+    优化：一次性返回邮件的完整信息，前端可以缓存
+    """
     email = email.strip()
     
     if not email:
@@ -1026,6 +419,7 @@ async def get_messages(email: str, top: int = None) -> ApiResponse:
         top = await get_system_config_value('email_limit', DEFAULT_EMAIL_LIMIT)
     
     try:
+        # 使用优化后的get_messages，返回完整邮件内容
         messages = await email_manager.get_messages(email, top)
         return ApiResponse(success=True, data=messages)
     except HTTPException as e:
@@ -1034,52 +428,33 @@ async def get_messages(email: str, top: int = None) -> ApiResponse:
         logger.error(f"获取邮件列表失败: {e}")
         return ApiResponse(success=False, message="获取邮件列表失败")
 
+# 注意：现在前端应该使用缓存的数据，不再需要单独的message detail端点
+# 但为了兼容性保留（如果前端直接访问）
 @app.get("/api/message/{message_id}")
 async def get_message_detail(message_id: str, email: str) -> ApiResponse:
-    """获取邮件详情"""
-    email = email.strip()
-    
-    if not email:
-        return ApiResponse(success=False, message="请提供邮箱地址")
-    
-    try:
-        message = await email_manager.get_message_detail(email, message_id)
-        return ApiResponse(success=True, data=message)
-    except HTTPException as e:
-        return ApiResponse(success=False, message=e.detail)
-    except Exception as e:
-        logger.error(f"获取邮件详情失败: {e}")
-        return ApiResponse(success=False, message="获取邮件详情失败")
+    """获取邮件详情（兼容性保留，建议前端使用缓存）"""
+    return ApiResponse(
+        success=False, 
+        message="请使用 /api/messages 接口获取邮件列表，包含完整内容"
+    )
 
 @app.post("/api/temp-messages")
 async def get_temp_messages(request: TempAccountRequest) -> ApiResponse:
-    """使用临时账户获取邮件列表"""
+    """使用临时账户获取邮件列表（包含完整内容）"""
     try:
-        # 创建临时邮件客户端
         account_info = {
             'password': request.password,
             'refresh_token': request.refresh_token
         }
         
-        # 使用指定的client_id或默认值
-        if request.client_id:
-            # 暂存原始CLIENT_ID
-            original_client_id = globals().get('CLIENT_ID')
-            globals()['CLIENT_ID'] = request.client_id
-        
-        temp_client = EmailClient(request.email, account_info)
+        temp_client = IMAPEmailClient(request.email, account_info)
         
         try:
-            # 获取邮件
-            messages = await temp_client.get_messages(top=request.top)
+            # 使用优化后的方法获取完整邮件
+            messages = await temp_client.get_messages_with_content(top=request.top)
             return ApiResponse(success=True, data=messages)
         finally:
-            # 清理临时客户端
             await temp_client.cleanup()
-            
-            # 恢复原始CLIENT_ID
-            if request.client_id and 'original_client_id' in locals():
-                globals()['CLIENT_ID'] = original_client_id
                 
     except HTTPException as e:
         return ApiResponse(success=False, message=e.detail)
@@ -1087,63 +462,29 @@ async def get_temp_messages(request: TempAccountRequest) -> ApiResponse:
         logger.error(f"临时账户获取邮件失败: {e}")
         return ApiResponse(success=False, message=f"获取邮件失败: {str(e)}")
 
-@app.post("/api/temp-message-detail")
-async def get_temp_message_detail(request: TempMessageDetailRequest) -> ApiResponse:
-    """使用临时账户获取邮件详情"""
-    try:
-        # 创建临时邮件客户端
-        account_info = {
-            'password': request.password,
-            'refresh_token': request.refresh_token
-        }
-        
-        # 使用指定的client_id或默认值
-        if request.client_id:
-            # 暂存原始CLIENT_ID
-            original_client_id = globals().get('CLIENT_ID')
-            globals()['CLIENT_ID'] = request.client_id
-        
-        temp_client = EmailClient(request.email, account_info)
-        
-        try:
-            # 获取邮件详情
-            message_detail = await temp_client.get_message_detail(request.message_id)
-            return ApiResponse(success=True, data=message_detail)
-        finally:
-            # 清理临时客户端
-            await temp_client.cleanup()
-            
-            # 恢复原始CLIENT_ID
-            if request.client_id and 'original_client_id' in locals():
-                globals()['CLIENT_ID'] = original_client_id
-                
-    except HTTPException as e:
-        return ApiResponse(success=False, message=e.detail)
-    except Exception as e:
-        logger.error(f"临时账户获取邮件详情失败: {e}")
-        return ApiResponse(success=False, message=f"获取邮件详情失败: {str(e)}")
-
 @app.get("/api/accounts")
 async def get_accounts(authorization: Optional[str] = Header(None)) -> ApiResponse:
     """获取所有账户列表（可选管理认证）"""
     try:
-        # 检查是否提供了管理认证
         is_admin = False
         if authorization and authorization.startswith("Bearer "):
             token = authorization[7:]
             is_admin = verify_admin_token(token)
         
         accounts = await load_accounts_config()
-        # 只返回邮箱地址，不包含敏感信息
         account_list = [{"email": email} for email in accounts.keys()]
         return ApiResponse(success=True, data=account_list, message=f"共 {len(account_list)} 个账户")
     except Exception as e:
         logger.error(f"获取账户列表失败: {e}")
         return ApiResponse(success=False, message="获取账户列表失败")
 
+# ============================================================================
+# 账户导入/导出API端点
+# ============================================================================
+
 @app.post("/api/import")
 async def import_accounts_dict(request_data: dict) -> dict:
-    """批量导入邮箱账户（使用简单字典格式）"""
+    """批量导入邮箱账户"""
     try:
         logger.info(f"完整请求数据: {request_data}")
         
@@ -1151,18 +492,12 @@ async def import_accounts_dict(request_data: dict) -> dict:
         merge_mode = request_data.get('merge_mode', 'update')
         
         logger.info(f"收到导入请求，账户数量: {len(accounts_data) if isinstance(accounts_data, (list, dict)) else 'N/A'}, 合并模式: {merge_mode}")
-        logger.info(f"原始请求数据类型: {type(request_data)}")
-        logger.info(f"账户数据类型: {type(accounts_data)}")
-        logger.info(f"账户数据内容: {accounts_data}")
         
-        # 检查accounts_data是否是字典而不是列表
+        # 检查并处理嵌套的accounts字段
         if isinstance(accounts_data, dict):
-            logger.error(f"账户数据是字典而不是列表: {accounts_data}")
-            # 如果accounts_data是解析结果字典，尝试提取accounts字段
             if 'accounts' in accounts_data:
                 logger.info("发现嵌套的accounts字段，正在提取...")
                 accounts_data = accounts_data['accounts']
-                logger.info(f"提取后的账户数据类型: {type(accounts_data)}, 内容: {accounts_data}")
             else:
                 return {
                     "success": False,
@@ -1175,10 +510,6 @@ async def import_accounts_dict(request_data: dict) -> dict:
                     "message": "账户数据格式错误：应该是数组"
                 }
         
-        if len(accounts_data) > 0:
-            logger.info(f"第一个账户数据类型: {type(accounts_data[0])}, 内容: {accounts_data[0]}")
-        
-        # 确保accounts_data是列表
         if not isinstance(accounts_data, list):
             return {
                 "success": False,
@@ -1195,8 +526,6 @@ async def import_accounts_dict(request_data: dict) -> dict:
         accounts = []
         for i, acc_data in enumerate(accounts_data):
             try:
-                logger.info(f"处理第{i+1}个账户: {acc_data} (类型: {type(acc_data)})")
-                
                 if isinstance(acc_data, str):
                     logger.error(f"账户数据是字符串而不是字典: {acc_data}")
                     continue
@@ -1212,10 +541,8 @@ async def import_accounts_dict(request_data: dict) -> dict:
                 logger.error(f"转换账户数据失败: {acc_data}, 错误: {e}")
                 continue
         
-        # 加载现有账户
+        # 加载现有账户并合并
         existing_accounts = await load_accounts_config()
-        
-        # 合并数据
         result = await merge_accounts_data(existing_accounts, accounts, merge_mode)
         
         # 保存更新后的数据
@@ -1225,7 +552,6 @@ async def import_accounts_dict(request_data: dict) -> dict:
                 result.success = False
                 result.message += "，但保存文件失败"
         
-        # 返回结果字典
         return {
             "success": result.success,
             "total_count": result.total_count,
@@ -1250,142 +576,6 @@ async def import_accounts_dict(request_data: dict) -> dict:
             "message": f"导入失败: {str(e)}"
         }
 
-# ============================================================================
-# 管理API端点
-# ============================================================================
-
-@app.post("/api/admin/verify")
-async def verify_admin_token_endpoint(request: AdminTokenRequest) -> ApiResponse:
-    """验证管理令牌"""
-    try:
-        is_valid = verify_admin_token(request.token)
-        if is_valid:
-            return ApiResponse(success=True, message="令牌验证成功")
-        else:
-            return ApiResponse(success=False, message="无效的管理令牌")
-    except Exception as e:
-        logger.error(f"令牌验证失败: {e}")
-        return ApiResponse(success=False, message="验证失败")
-
-@app.delete("/api/admin/accounts")
-async def delete_account(request: DeleteAccountRequest, token: str = Depends(get_admin_token)) -> ApiResponse:
-    """删除指定账户"""
-    try:
-        # 加载现有账户
-        accounts = await load_accounts_config()
-        
-        if request.email not in accounts:
-            return ApiResponse(success=False, message=f"账户 {request.email} 不存在")
-        
-        # 删除账户
-        del accounts[request.email]
-        
-        # 保存更新后的数据
-        save_success = await save_accounts_config(accounts)
-        
-        if save_success:
-            # 清理相关的客户端连接
-            if request.email in email_manager.clients:
-                try:
-                    await email_manager.clients[request.email].cleanup()
-                    del email_manager.clients[request.email]
-                except Exception as e:
-                    logger.warning(f"清理客户端连接失败 ({request.email}): {e}")
-            
-            return ApiResponse(success=True, message=f"账户 {request.email} 删除成功")
-        else:
-            return ApiResponse(success=False, message="保存配置文件失败")
-            
-    except Exception as e:
-        logger.error(f"删除账户失败: {e}")
-        return ApiResponse(success=False, message=f"删除失败: {str(e)}")
-
-@app.get("/api/export")
-async def export_accounts_public(format: str = "txt"):
-    """公开导出账户配置（不需要令牌）"""
-    try:
-        # 加载现有账户
-        accounts = await load_accounts_config()
-        
-        if not accounts:
-            raise HTTPException(status_code=404, detail="暂无账户数据")
-        
-        # 生成导出内容
-        export_lines = []
-        export_lines.append("# Outlook邮件系统账号配置文件")
-        export_lines.append(f"# 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        export_lines.append("# 格式: 邮箱----密码----client_id----refresh_token")
-        export_lines.append("# 注意：请妥善保管此文件，包含敏感信息")
-        export_lines.append("")
-        
-        # 添加账户数据
-        for email, account_info in accounts.items():
-            password = account_info.get('password', '')
-            refresh_token = account_info.get('refresh_token', '')
-            client_id = account_info.get('client_id', CLIENT_ID)
-            line = f"{email}----{password}----{client_id}----{refresh_token}"
-            export_lines.append(line)
-        
-        export_content = "\n".join(export_lines)
-        
-        # 设置响应头，让浏览器下载文件
-        filename = f"outlook_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        
-        return PlainTextResponse(
-            content=export_content,
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Content-Type": "text/plain; charset=utf-8"
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"导出账户配置失败: {e}")
-        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
-
-@app.get("/api/admin/export")
-async def export_accounts(token: str = Depends(get_admin_token)):
-    """导出账户配置（纯文本格式）"""
-    try:
-        # 加载现有账户
-        accounts = await load_accounts_config()
-        
-        if not accounts:
-            raise HTTPException(status_code=404, detail="暂无账户数据")
-        
-        # 生成导出内容
-        export_lines = []
-        export_lines.append("# Outlook邮件系统账号配置文件")
-        export_lines.append(f"# 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        export_lines.append("# 格式: 邮箱----密码----client_id----refresh_token")
-        export_lines.append("# 注意：请妥善保管此文件，包含敏感信息")
-        export_lines.append("")
-        
-        # 添加账户数据
-        for email, account_info in accounts.items():
-            password = account_info.get('password', '')
-            refresh_token = account_info.get('refresh_token', '')
-            client_id = account_info.get('client_id', CLIENT_ID)
-            line = f"{email}----{password}----{client_id}----{refresh_token}"
-            export_lines.append(line)
-        
-        export_content = "\n".join(export_lines)
-        
-        # 设置响应头，让浏览器下载文件
-        filename = f"outlook_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        
-        return PlainTextResponse(
-            content=export_content,
-            headers={
-                "Content-Disposition": f"attachment; filename={filename}",
-                "Content-Type": "text/plain; charset=utf-8"
-            }
-        )
-        
-    except Exception as e:
-        logger.error(f"导出账户配置失败: {e}")
-        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
-
 @app.post("/api/parse-import-text")
 async def parse_import_text(request: dict) -> ApiResponse:
     """解析导入文本格式数据"""
@@ -1404,7 +594,6 @@ async def parse_import_text(request: dict) -> ApiResponse:
                 continue
                 
             try:
-                # 解析格式：用户名----密码----client_id----refresh_token
                 parts = line.split('----')
                 if len(parts) >= 4:
                     email, password, client_id, refresh_token = parts[0], parts[1], parts[2], parts[3]
@@ -1414,7 +603,7 @@ async def parse_import_text(request: dict) -> ApiResponse:
                         "client_id": client_id.strip(),
                         "refresh_token": refresh_token.strip()
                     })
-                elif len(parts) == 2:  # 兼容旧格式：邮箱----refresh_token
+                elif len(parts) == 2:
                     email, refresh_token = parts
                     accounts.append({
                         "email": email.strip(),
@@ -1451,97 +640,43 @@ async def parse_import_text(request: dict) -> ApiResponse:
         logger.error(f"解析导入文本失败: {e}")
         return ApiResponse(success=False, message=f"解析失败: {str(e)}")
 
-@app.post("/api/account")
-async def add_account(account: ImportAccountData) -> ApiResponse:
-    """添加单个账户"""
+@app.get("/api/export")
+async def export_accounts_public(format: str = "txt"):
+    """公开导出账户配置"""
     try:
-        # 加载现有账户
-        existing_accounts = await load_accounts_config()
+        accounts = await load_accounts_config()
         
-        # 检查是否已存在
-        if account.email in existing_accounts:
-            return ApiResponse(success=False, message=f"账户 {account.email} 已存在")
+        if not accounts:
+            raise HTTPException(status_code=404, detail="暂无账户数据")
         
-        # 添加新账户
-        existing_accounts[account.email] = {
-            'password': account.password or '',
-            'refresh_token': account.refresh_token
-        }
+        export_lines = []
+        export_lines.append("# Outlook邮件系统账号配置文件")
+        export_lines.append(f"# 导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        export_lines.append("# 格式: 邮箱----密码----client_id----refresh_token")
+        export_lines.append("# 注意：请妥善保管此文件，包含敏感信息")
+        export_lines.append("")
         
-        # 保存数据
-        save_success = await save_accounts_config(existing_accounts)
+        for email, account_info in accounts.items():
+            password = account_info.get('password', '')
+            refresh_token = account_info.get('refresh_token', '')
+            client_id = account_info.get('client_id', CLIENT_ID)
+            line = f"{email}----{password}----{client_id}----{refresh_token}"
+            export_lines.append(line)
         
-        if save_success:
-            return ApiResponse(success=True, message=f"成功添加账户 {account.email}")
-        else:
-            return ApiResponse(success=False, message="保存账户数据失败")
-            
-    except Exception as e:
-        logger.error(f"添加账户失败: {e}")
-        return ApiResponse(success=False, message=f"添加账户失败: {str(e)}")
-
-@app.put("/api/account/{email}")
-async def update_account(email: str, account: ImportAccountData) -> ApiResponse:
-    """更新账户信息"""
-    try:
-        # 加载现有账户
-        existing_accounts = await load_accounts_config()
+        export_content = "\n".join(export_lines)
+        filename = f"outlook_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         
-        # 检查账户是否存在
-        if email not in existing_accounts:
-            return ApiResponse(success=False, message=f"账户 {email} 不存在")
-        
-        # 更新账户信息
-        existing_accounts[email] = {
-            'password': account.password or existing_accounts[email].get('password', ''),
-            'refresh_token': account.refresh_token
-        }
-        
-        # 如果邮箱地址发生变化，需要删除旧的并添加新的
-        if email != account.email:
-            del existing_accounts[email]
-            existing_accounts[account.email] = {
-                'password': account.password or '',
-                'refresh_token': account.refresh_token
+        return PlainTextResponse(
+            content=export_content,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "Content-Type": "text/plain; charset=utf-8"
             }
+        )
         
-        # 保存数据
-        save_success = await save_accounts_config(existing_accounts)
-        
-        if save_success:
-            return ApiResponse(success=True, message=f"成功更新账户 {account.email}")
-        else:
-            return ApiResponse(success=False, message="保存账户数据失败")
-            
     except Exception as e:
-        logger.error(f"更新账户失败: {e}")
-        return ApiResponse(success=False, message=f"更新账户失败: {str(e)}")
-
-@app.delete("/api/account/{email}")
-async def delete_account(email: str) -> ApiResponse:
-    """删除账户"""
-    try:
-        # 加载现有账户
-        existing_accounts = await load_accounts_config()
-        
-        # 检查账户是否存在
-        if email not in existing_accounts:
-            return ApiResponse(success=False, message=f"账户 {email} 不存在")
-        
-        # 删除账户
-        del existing_accounts[email]
-        
-        # 保存数据
-        save_success = await save_accounts_config(existing_accounts)
-        
-        if save_success:
-            return ApiResponse(success=True, message=f"成功删除账户 {email}")
-        else:
-            return ApiResponse(success=False, message="保存账户数据失败")
-            
-    except Exception as e:
-        logger.error(f"删除账户失败: {e}")
-        return ApiResponse(success=False, message=f"删除账户失败: {str(e)}")
+        logger.error(f"导出账户配置失败: {e}")
+        raise HTTPException(status_code=500, detail=f"导出失败: {str(e)}")
 
 # ============================================================================
 # 系统配置API端点
@@ -1561,7 +696,6 @@ async def get_system_config() -> ApiResponse:
 async def update_system_config(request: SystemConfigRequest) -> ApiResponse:
     """更新系统配置"""
     try:
-        # 验证邮件限制范围
         if request.email_limit < 1 or request.email_limit > 50:
             return ApiResponse(success=False, message="邮件限制必须在1-50之间")
         
@@ -1575,74 +709,17 @@ async def update_system_config(request: SystemConfigRequest) -> ApiResponse:
         return ApiResponse(success=False, message="更新系统配置失败")
 
 # ============================================================================
-# 账户标签管理API端点
-# ============================================================================
-
-@app.get("/api/account/{email}/tags")
-async def get_account_tags(email: str, token: str = Depends(get_admin_token)) -> ApiResponse:
-    """获取账户标签（使用数据库）"""
-    try:
-        # 检查账户是否存在
-        accounts = await load_accounts_config()
-        if email not in accounts:
-            return ApiResponse(success=False, message=f"账户 {email} 不存在")
-        
-        tags = await db_manager.get_account_tags(email)
-        return ApiResponse(success=True, data={"email": email, "tags": tags})
-    except Exception as e:
-        logger.error(f"获取账户标签失败: {e}")
-        return ApiResponse(success=False, message="获取账户标签失败")
-
-@app.post("/api/account/{email}/tags")
-async def update_account_tags(email: str, request: AccountTagRequest, token: str = Depends(get_admin_token)) -> ApiResponse:
-    """更新账户标签（使用数据库）"""
-    try:
-        # 检查账户是否存在
-        accounts = await load_accounts_config()
-        if email not in accounts:
-            return ApiResponse(success=False, message=f"账户 {email} 不存在")
-        
-        # 更新标签到数据库
-        success = await db_manager.set_account_tags(email, request.tags)
-        if success:
-            return ApiResponse(success=True, message=f"成功更新账户 {email} 的标签")
-        else:
-            return ApiResponse(success=False, message="保存账户标签失败")
-    except Exception as e:
-        logger.error(f"更新账户标签失败: {e}")
-        return ApiResponse(success=False, message="更新账户标签失败")
-
-@app.get("/api/accounts/tags")
-async def get_all_tags(token: str = Depends(get_admin_token)) -> ApiResponse:
-    """获取所有标签和账户标签映射（使用数据库）"""
-    try:
-        # 获取所有标签
-        all_tags = await db_manager.get_all_tags()
-        
-        # 获取账户标签映射
-        accounts_with_tags = await db_manager.get_accounts_with_tags()
-        
-        return ApiResponse(success=True, data={
-            "tags": all_tags,
-            "accounts": accounts_with_tags
-        })
-    except Exception as e:
-        logger.error(f"获取所有标签失败: {e}")
-        return ApiResponse(success=False, message="获取所有标签失败")
-
-# ============================================================================
 # 测试邮件API端点
 # ============================================================================
 
 @app.post("/api/test-email")
 async def test_email_connection(request: dict) -> ApiResponse:
-    """测试邮件连接，只获取最新的1条邮件"""
+    """测试邮件连接，获取最新的1条邮件"""
     try:
         email = request.get('email', '').strip()
         if not email:
             return ApiResponse(success=False, message="请提供邮箱地址")
         
-        # 检查是否为临时账户测试
         if 'refresh_token' in request:
             # 临时账户测试
             account_info = {
@@ -1650,10 +727,9 @@ async def test_email_connection(request: dict) -> ApiResponse:
                 'refresh_token': request.get('refresh_token', '')
             }
             
-            temp_client = EmailClient(email, account_info)
+            temp_client = IMAPEmailClient(email, account_info)
             try:
-                # 只获取最新的1条邮件
-                messages = await temp_client.get_messages(top=1)
+                messages = await temp_client.get_messages_with_content(top=1)
                 if messages:
                     latest_message = messages[0]
                     return ApiResponse(
@@ -1692,63 +768,12 @@ async def test_email_connection(request: dict) -> ApiResponse:
         logger.error(f"测试邮件连接失败: {e}")
         return ApiResponse(success=False, message=f"测试失败: {str(e)}")
 
-@app.get("/api/export")
-async def export_accounts(format: str = "txt") -> ApiResponse:
-    """导出账户数据"""
-    try:
-        accounts = await load_accounts_config()
-        
-        if format.lower() == "json":
-            # JSON格式导出
-            export_data = {
-                "accounts": [
-                    {
-                        "email": email,
-                        "password": info.get('password', ''),
-                        "client_id": CLIENT_ID,
-                        "refresh_token": info.get('refresh_token', '')
-                    }
-                    for email, info in accounts.items()
-                ],
-                "exported_at": datetime.now().isoformat(),
-                "total_count": len(accounts)
-            }
-            
-            return ApiResponse(
-                success=True, 
-                data=export_data, 
-                message=f"成功导出JSON格式数据，共 {len(accounts)} 个账户"
-            )
-            
-        else:
-            # TXT格式导出
-            lines = [
-                "# 批量邮箱账户配置文件",
-                "# 格式：用户名----密码----client_id----refresh_token",
-                "# 每行一个账户，用----分隔各字段",
-                ""
-            ]
-            
-            for email, info in accounts.items():
-                password = info.get('password', '')
-                refresh_token = info.get('refresh_token', '')
-                line = f"{email}----{password}----{CLIENT_ID}----{refresh_token}"
-                lines.append(line)
-            
-            export_text = "\n".join(lines)
-            
-            return ApiResponse(
-                success=True, 
-                data={"content": export_text, "filename": f"accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"}, 
-                message=f"成功导出TXT格式数据，共 {len(accounts)} 个账户"
-            )
-            
-    except Exception as e:
-        logger.error(f"导出账户数据失败: {e}")
-        return ApiResponse(success=False, message=f"导出失败: {str(e)}")
+# ============================================================================
+# 命令行入口
+# ============================================================================
 
 async def main():
-    """命令行模式入口（异步版本）"""
+    """命令行模式入口"""
     try:
         accounts = await load_accounts_config()
         if not accounts:
@@ -1783,9 +808,9 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'web':
         # Web模式
         print("启动Web服务器...")
-        print("访问 http://localhost:5000 查看前端界面")
-        # 不使用reload以避免导入问题
-        uvicorn.run(app, host="0.0.0.0", port=5000, log_level="info")
+        print("访问 http://localhost:5001 查看前端界面")
+        uvicorn.run(app, host="0.0.0.0", port=5001, log_level="info")
     else:
         # 命令行模式
         asyncio.run(main())
+
