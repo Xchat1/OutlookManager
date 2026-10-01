@@ -95,6 +95,67 @@ class AdminManager {
                 modal.show();
             });
         }
+
+        // OAuth 添加账号
+        const oauthBtn = document.getElementById('oauthAddAccountBtn');
+        if (oauthBtn) {
+            oauthBtn.addEventListener('click', this.startOAuth.bind(this));
+        }
+
+        // 监听 OAuth 回调消息
+        window.addEventListener('message', (e) => {
+            if (e.data && e.data.type === 'oauth_success') {
+                this.showToast(`✅ 账号 ${e.data.email} 已成功添加`, 'success');
+                this.loadAccounts();
+            }
+        });
+    }
+
+    // ==================== OAuth 添加账号 ====================
+
+    async startOAuth() {
+        try {
+            const resp = await fetch('/oauth/start');
+            const data = await resp.json();
+            if (!data.url) throw new Error('未获取到授权 URL');
+
+            const w = 520, h = 640;
+            const left = Math.round(window.screenX + (window.outerWidth - w) / 2);
+            const top  = Math.round(window.screenY + (window.outerHeight - h) / 2);
+            const popup = window.open(
+                data.url,
+                'oauth_popup',
+                `width=${w},height=${h},left=${left},top=${top},toolbar=no,menubar=no,scrollbars=yes`
+            );
+
+            if (!popup) {
+                this.showError('弹窗被浏览器拦截，请允许弹窗后重试');
+                return;
+            }
+
+            this.showToast('已打开授权窗口，请在弹窗中完成登录', 'info');
+        } catch (e) {
+            this.showError('启动 OAuth 失败: ' + e.message);
+        }
+    }
+
+    // ==================== Toast 提示 ====================
+
+    showToast(message, type = 'info', duration = 4000) {
+        const existing = document.querySelector('.oauth-toast');
+        if (existing) existing.remove();
+
+        const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+        const toast = document.createElement('div');
+        toast.className = `oauth-toast ${type}`;
+        toast.innerHTML = `<span>${icons[type] || ''}</span><span>${message}</span>`;
+        document.body.appendChild(toast);
+
+        setTimeout(() => {
+            toast.style.opacity = '0';
+            toast.style.transition = 'opacity 0.3s';
+            setTimeout(() => toast.remove(), 300);
+        }, duration);
     }
 
     checkStoredAuth() {
@@ -261,6 +322,11 @@ class AdminManager {
                                     title="管理标签">
                                 <i class="bi bi-tags"></i>
                             </button>
+                            <button class="btn btn-outline-danger btn-sm"
+                                    onclick="adminManager.deleteAccount('${account.email}')"
+                                    title="删除账号">
+                                <i class="bi bi-trash"></i>
+                            </button>
                         </div>
                     </td>
                 </tr>
@@ -269,9 +335,26 @@ class AdminManager {
         tbody.innerHTML = accountsHtml;
     }
 
-    // 已移除测试与系统配置相关功能
+    // ==================== 删除账号 ====================
 
-    // 删除账户功能不在精简范围内，已移除调用
+    async deleteAccount(email) {
+        if (!confirm(`确定要删除账号 ${email} 吗？此操作不可恢复。`)) return;
+        try {
+            const resp = await fetch(`/api/account/${encodeURIComponent(email)}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${this.token}` }
+            });
+            const result = await resp.json();
+            if (result.success) {
+                this.showToast(`账号 ${email} 已删除`, 'success');
+                this.loadAccounts();
+            } else {
+                this.showError(result.message || '删除失败');
+            }
+        } catch (e) {
+            this.showError('删除失败: ' + e.message);
+        }
+    }
 
     clearImport() {
         document.getElementById('importTextarea').value = '';

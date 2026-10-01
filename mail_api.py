@@ -9,14 +9,20 @@ import asyncio
 import json
 import logging
 import os
+import hashlib
+import secrets
+import string
+import base64
+import requests as req_sync
 from datetime import datetime
 from typing import Dict, List, Optional
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import quote, parse_qs, urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 
@@ -27,8 +33,36 @@ from models import (
     DeleteAccountRequest, TempAccountRequest, SystemConfigRequest,
     AccountTagRequest, TestEmailRequest
 )
-from config import CLIENT_ID, ADMIN_TOKEN, DEFAULT_EMAIL_LIMIT, logger
+from config import CLIENT_ID, ADMIN_TOKEN, DEFAULT_EMAIL_LIMIT, logger, TOKEN_URL
 from imap_client import IMAPEmailClient
+
+# ============================================================================
+# OAuth2 配置
+# ============================================================================
+
+AUTH_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize"
+REDIRECT_URI = "http://localhost:5001/oauth/callback"
+SCOPES = [
+    "offline_access",
+    "https://outlook.office.com/IMAP.AccessAsUser.All",
+    "https://graph.microsoft.com/Mail.ReadWrite",
+    "https://graph.microsoft.com/User.Read",
+]
+
+# OAuth 会话存储（生产环境应使用 Redis 等）
+_oauth_sessions = {}
+
+# ============================================================================
+# PKCE 工具函数
+# ============================================================================
+
+def gen_code_verifier(length: int = 128) -> str:
+    alphabet = string.ascii_letters + string.digits + "-._~"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+def gen_code_challenge(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 # ============================================================================
 # 辅助函数
@@ -891,6 +925,160 @@ async def test_email_connection(request: dict) -> ApiResponse:
     except Exception as e:
         logger.error(f"测试邮件连接失败: {e}")
         return ApiResponse(success=False, message=f"测试失败: {str(e)}")
+
+# ============================================================================
+# OAuth2 添加账号路由
+# ============================================================================
+
+@app.get("/oauth/start")
+async def oauth_start():
+    """生成授权 URL，前端弹窗打开"""
+    state     = secrets.token_urlsafe(16)
+    verifier  = gen_code_verifier()
+    challenge = gen_code_challenge(verifier)
+
+    _oauth_sessions[state] = {"verifier": verifier}
+
+    params = {
+        "client_id":             CLIENT_ID,
+        "response_type":         "code",
+        "redirect_uri":          REDIRECT_URI,
+        "scope":                 " ".join(SCOPES),
+        "response_mode":         "query",
+        "state":                 state,
+        "code_challenge":        challenge,
+        "code_challenge_method": "S256",
+    }
+    qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    url = f"{AUTH_URL}?{qs}"
+    return JSONResponse({"url": url, "state": state})
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(request: Request):
+    """接收微软回调，换取 token 并保存账号"""
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state")
+    error = request.query_params.get("error")
+    error_desc = request.query_params.get("error_description", "未知错误")
+
+    # 失败页面
+    def fail_page(msg: str) -> HTMLResponse:
+        return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>授权失败</title>
+<style>body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#fef2f2}}
+.box{{text-align:center;padding:40px;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1)}}
+h2{{color:#ef4444}}p{{color:#6b7280;margin:12px 0 24px}}
+button{{padding:10px 24px;background:#4f46e5;color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px}}</style>
+</head><body><div class="box">
+<h2>&#10060; 授权失败</h2><p>{msg}</p>
+<button onclick="window.close()">关闭窗口</button>
+</div></body></html>""")
+
+    # 成功页面
+    def ok_page(email: str) -> HTMLResponse:
+        return HTMLResponse(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>授权成功</title>
+<style>body{{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0fdf4}}
+.box{{text-align:center;padding:40px;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1)}}
+h2{{color:#10b981}}p{{color:#6b7280;margin:12px 0 4px}}small{{color:#9ca3af}}
+button{{margin-top:20px;padding:10px 24px;background:#4f46e5;color:white;border:none;border-radius:8px;cursor:pointer;font-size:14px}}</style>
+<script>
+  // 通知父窗口刷新账号列表
+  if (window.opener) {{
+    window.opener.postMessage({{type:'oauth_success', email:'{email}'}}, '*');
+  }}
+  setTimeout(() => window.close(), 2000);
+</script>
+</head><body><div class="box">
+<h2>&#10003; 授权成功</h2>
+<p><strong>{email}</strong></p>
+<small>账号已自动添加，窗口将在 2 秒后关闭</small>
+<br><button onclick="window.close()">立即关闭</button>
+</div></body></html>""")
+
+    if error:
+        return fail_page(f"{error}: {error_desc}")
+
+    if not code or not state:
+        return fail_page("缺少授权码或 state 参数")
+
+    session = _oauth_sessions.pop(state, None)
+    if not session:
+        return fail_page("无效或已过期的 state，请重新发起授权")
+
+    # 用授权码换 token
+    try:
+        resp = req_sync.post(TOKEN_URL, data={
+            "client_id":     CLIENT_ID,
+            "grant_type":    "authorization_code",
+            "code":          code,
+            "redirect_uri":  REDIRECT_URI,
+            "scope":         " ".join(SCOPES),
+            "code_verifier": session["verifier"],
+        }, timeout=20)
+        resp.raise_for_status()
+        tokens = resp.json()
+    except Exception as e:
+        logger.error(f"OAuth 换取 token 失败: {e}")
+        return fail_page(f"换取 Token 失败: {e}")
+
+    refresh_token = tokens.get("refresh_token")
+    access_token  = tokens.get("access_token")
+
+    if not refresh_token:
+        err = tokens.get("error_description", tokens.get("error", "响应中无 refresh_token"))
+        return fail_page(err)
+
+    # 用 access_token 获取邮箱地址
+    email = None
+    if access_token:
+        try:
+            me = req_sync.get(
+                "https://graph.microsoft.com/v1.0/me",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10
+            )
+            if me.ok:
+                profile = me.json()
+                email = profile.get("mail") or profile.get("userPrincipalName")
+        except Exception as e:
+            logger.warning(f"获取用户信息失败: {e}")
+
+    if not email:
+        return fail_page("无法获取邮箱地址，请确认账号权限")
+
+    # 保存到数据库
+    exists = await db_manager.account_exists(email)
+    if exists:
+        await db_manager.update_account(email, refresh_token=refresh_token)
+        logger.info(f"OAuth 更新账号: {email}")
+    else:
+        await db_manager.add_account(email, refresh_token=refresh_token)
+        logger.info(f"OAuth 新增账号: {email}")
+
+    return ok_page(email)
+
+
+# ============================================================================
+# 账号删除 API
+# ============================================================================
+
+@app.delete("/api/account/{email}")
+async def delete_account(email: str, authorization: Optional[str] = Header(None)) -> ApiResponse:
+    """删除指定账号"""
+    try:
+        _ = get_admin_token(authorization)
+        ok = await db_manager.delete_account(email)
+        if ok:
+            return ApiResponse(success=True, message=f"账号 {email} 已删除")
+        return ApiResponse(success=False, message="账号不存在或删除失败")
+    except HTTPException as e:
+        return ApiResponse(success=False, message=e.detail)
+    except Exception as e:
+        logger.error(f"删除账号失败: {e}")
+        return ApiResponse(success=False, message="删除失败")
+
 
 # ============================================================================
 # 命令行入口

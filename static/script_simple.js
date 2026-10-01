@@ -6,13 +6,20 @@ class SimpleEmailManager {
         this.latestEmail = null;
         this.tempAccount = null;
         this.usingTempAccount = false;
-        
+        this.isLoading = false;
+
         this.init();
     }
 
     init() {
         this.bindEvents();
         this.loadTempAccount();
+        
+        // 自动聚焦输入框
+        const emailInput = document.getElementById('emailInput');
+        if (emailInput) {
+            emailInput.focus();
+        }
     }
 
     bindEvents() {
@@ -39,6 +46,14 @@ class SimpleEmailManager {
             });
         }
 
+        // 快速临时账户按钮
+        const quickTempAccountBtn = document.getElementById('quickTempAccountBtn');
+        if (quickTempAccountBtn) {
+            quickTempAccountBtn.addEventListener('click', () => {
+                this.showTempAccountModal();
+            });
+        }
+
         // 临时账户表单
         const tempAccountForm = document.getElementById('tempAccountForm');
         if (tempAccountForm) {
@@ -60,13 +75,19 @@ class SimpleEmailManager {
     async loadLatestEmail() {
         const emailInput = document.getElementById('emailInput');
         const email = emailInput.value.trim();
-        
+
         if (!email) {
             this.showError('请输入邮箱地址');
             return;
         }
 
+        // 防止重复请求
+        if (this.isLoading) {
+            return;
+        }
+
         this.currentEmail = email;
+        this.isLoading = true;
         this.showLoading();
 
         try {
@@ -77,7 +98,7 @@ class SimpleEmailManager {
                     'Content-Type': 'application/json'
                 }
             };
-            
+
             // 如果使用临时账户
             if (this.usingTempAccount && this.tempAccount && this.tempAccount.email === email) {
                 apiUrl = '/api/temp-messages';
@@ -90,10 +111,10 @@ class SimpleEmailManager {
                     top: 1
                 });
             }
-            
+
             const response = await fetch(apiUrl, requestOptions);
             const result = await response.json();
-            
+
             if (result.success && result.data && result.data.length > 0) {
                 this.latestEmail = result.data[0];
                 this.displayEmail();
@@ -104,13 +125,15 @@ class SimpleEmailManager {
         } catch (error) {
             console.error('Error loading email:', error);
             this.showError('网络错误，请检查连接');
+        } finally {
+            this.isLoading = false;
         }
     }
 
     displayEmail() {
         const emailContent = document.getElementById('emailContent');
         const email = this.latestEmail;
-        
+
         if (!email) {
             this.showEmpty();
             return;
@@ -119,22 +142,22 @@ class SimpleEmailManager {
         const sender = email.sender?.emailAddress || email.from?.emailAddress || {};
         const senderName = sender.name || sender.address || '未知发件人';
         const senderAddress = sender.address || '';
-        
+
         const toRecipients = email.toRecipients || [];
         const recipients = toRecipients.map(r => r.emailAddress?.name || r.emailAddress?.address).join(', ') || '未知收件人';
-        
+
         const subject = email.subject || '(无主题)';
         const date = this.formatDate(email.receivedDateTime);
         const body = email.body?.content || '(无内容)';
         const contentType = email.body?.contentType || 'text';
-        
+
         // 检查是否为HTML内容
-        const isHtmlContent = contentType === 'html' || 
-                              body.includes('<html') || 
-                              body.includes('<body') || 
-                              body.includes('<div') || 
+        const isHtmlContent = contentType === 'html' ||
+                              body.includes('<html') ||
+                              body.includes('<body') ||
+                              body.includes('<div') ||
                               body.includes('<p>');
-        
+
         let bodyHtml = '';
         if (isHtmlContent) {
             bodyHtml = this.sanitizeHtml(body);
@@ -143,28 +166,36 @@ class SimpleEmailManager {
         }
 
         emailContent.innerHTML = `
-            <div class="email-meta">
-                <div class="email-subject">${this.escapeHtml(subject)}</div>
-                <div class="email-info">
-                    <div class="info-row">
-                        <i class="bi bi-person-circle"></i>
-                        <span class="info-label">发件人：</span>
-                        <span class="info-value">${this.escapeHtml(senderName)}</span>
-                        ${senderAddress ? `<span class="badge-custom"><i class="bi bi-envelope-fill"></i>${this.escapeHtml(senderAddress)}</span>` : ''}
-                    </div>
-                    <div class="info-row">
-                        <i class="bi bi-people"></i>
-                        <span class="info-label">收件人：</span>
-                        <span class="info-value">${this.escapeHtml(recipients)}</span>
-                    </div>
-                    <div class="info-row">
-                        <i class="bi bi-clock"></i>
-                        <span class="info-label">时间：</span>
-                        <span class="info-value">${date}</span>
+            <div class="email-card">
+                <div class="email-header">
+                    <div class="email-subject">${this.escapeHtml(subject)}</div>
+                    <div class="email-meta">
+                        <div class="meta-item">
+                            <div class="meta-icon">
+                                <i class="bi bi-person"></i>
+                            </div>
+                            <span class="meta-label">发件人</span>
+                            <span class="meta-value">${this.escapeHtml(senderName)}</span>
+                            ${senderAddress ? `<span class="email-badge"><i class="bi bi-envelope"></i>${this.escapeHtml(senderAddress)}</span>` : ''}
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-icon">
+                                <i class="bi bi-people"></i>
+                            </div>
+                            <span class="meta-label">收件人</span>
+                            <span class="meta-value">${this.escapeHtml(recipients)}</span>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-icon">
+                                <i class="bi bi-clock"></i>
+                            </div>
+                            <span class="meta-label">时间</span>
+                            <span class="meta-value">${date}</span>
+                        </div>
                     </div>
                 </div>
+                <div class="email-body">${bodyHtml}</div>
             </div>
-            <div class="email-body">${bodyHtml}</div>
         `;
     }
 
@@ -172,8 +203,13 @@ class SimpleEmailManager {
         const emailContent = document.getElementById('emailContent');
         emailContent.innerHTML = `
             <div class="loading-state">
-                <div class="spinner"></div>
-                <p style="color: #0078d4; font-weight: 500;">正在加载最新邮件...</p>
+                <div class="loader">
+                    <div class="loader-circle"></div>
+                    <div class="loader-circle"></div>
+                    <div class="loader-circle"></div>
+                </div>
+                <div class="loading-text">正在加载最新邮件...</div>
+                <div class="loading-subtext">请稍候，正在从服务器获取邮件信息</div>
             </div>
         `;
     }
@@ -182,11 +218,31 @@ class SimpleEmailManager {
         const emailContent = document.getElementById('emailContent');
         emailContent.innerHTML = `
             <div class="empty-state">
-                <i class="bi bi-envelope"></i>
-                <h3>${message}</h3>
-                <p>在上方输入邮箱地址，即可查看该邮箱的最新一封邮件</p>
+                <div class="empty-icon">
+                    <i class="bi bi-inbox"></i>
+                </div>
+                <h3 class="empty-title">${message}</h3>
+                <p class="empty-description">在上方输入邮箱地址，即可查看该邮箱的最新邮件</p>
+                <div class="quick-actions">
+                    <button class="quick-action-btn" onclick="document.getElementById('emailInput').focus()">
+                        <i class="bi bi-pencil-square"></i>
+                        开始输入
+                    </button>
+                    <button class="quick-action-btn" id="quickTempAccountBtn">
+                        <i class="bi bi-person-plus"></i>
+                        使用临时账户
+                    </button>
+                </div>
             </div>
         `;
+        
+        // 重新绑定快速临时账户按钮事件
+        const quickTempAccountBtn = document.getElementById('quickTempAccountBtn');
+        if (quickTempAccountBtn) {
+            quickTempAccountBtn.addEventListener('click', () => {
+                this.showTempAccountModal();
+            });
+        }
     }
 
 
@@ -200,10 +256,12 @@ class SimpleEmailManager {
     showError(message) {
         const emailContent = document.getElementById('emailContent');
         emailContent.innerHTML = `
-            <div class="empty-state">
-                <i class="bi bi-exclamation-triangle" style="color: #f56565;"></i>
-                <h3 style="color: #f56565;">错误</h3>
-                <p>${this.escapeHtml(message)}</p>
+            <div class="error-state">
+                <div class="error-icon">
+                    <i class="bi bi-exclamation-triangle"></i>
+                </div>
+                <h3 class="error-title">出错了</h3>
+                <p class="error-message">${this.escapeHtml(message)}</p>
             </div>
         `;
     }
